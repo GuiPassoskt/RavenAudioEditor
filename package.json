@@ -1,0 +1,30 @@
+{
+  "name": "raven-audio-editor",
+  "version": "0.1.0",
+  "description": "Editor de Ã¡udio multipista inspirado no Audacity 3.7.9, construÃ­do com Quasar Framework",
+  "productName": "Raven Audio Editor",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "quasar dev",
+    "build": "quasar build",
+    "test": "node --test \"tests/**/*.test.js\"",
+    "postinstall": "quasar prepare"
+  },
+  "dependencies": {
+    "@quasar/extras": "^1.16.17",
+    "pinia": "^3.0.1",
+    "quasar": "^2.18.1",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@quasar/app-vite": "2.5.3",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.3",
+    "sass-embedded": "^1.86.0"
+  },
+  "engines": {
+    "node": ">= 20"
+  }
+}
