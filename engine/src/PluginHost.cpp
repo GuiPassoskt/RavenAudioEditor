@@ -24,9 +24,27 @@ public:
 
     ~Instance() override
     {
+        plugin->removeListener (this);
+
+        if (window != nullptr && keepEditorAlive (*plugin))
+        {
+            // Ver keepEditorAlive(): a janela e a instância ficam vivas até o motor encerrar.
+            window->setVisible (false);
+            window.release();
+            plugin.release();
+            return;
+        }
+
         // A janela (e o editor dentro dela) precisa sumir antes do plugin.
         window.reset();
-        plugin->removeListener (this);
+    }
+
+    void closeWindow()
+    {
+        if (window != nullptr && keepEditorAlive (*plugin))
+            window->setVisible (false);
+        else
+            window.reset();
     }
 
     const int id;
@@ -316,6 +334,7 @@ juce::var PluginHost::openEditor (const juce::var& message)
     }
     else
     {
+        instance.window->setVisible (true);
         instance.window->toFront (true);
     }
 
@@ -324,7 +343,7 @@ juce::var PluginHost::openEditor (const juce::var& message)
 
 juce::var PluginHost::closeEditor (const juce::var& message)
 {
-    getInstance (message).window.reset();
+    getInstance (message).closeWindow();
     return true;
 }
 
@@ -415,7 +434,7 @@ void PluginHost::onEditorClosed (int instanceId)
         if (it == instances.end())
             return;
 
-        it->second->window.reset();
+        it->second->closeWindow();
         sendEvent ("fx.editorClosed", object ({ { "instanceId", instanceId } }));
     });
 }

@@ -310,7 +310,7 @@ nele em fases. A Fase 1 usa esse mesmo processo só para aplicar efeitos (Opçã
 | 1 ✅ | Executável JUCE (`raven-engine`) iniciado pelo Electron, que **lista plugins** VST3/LV2 instalados e **aplica efeito em trecho** (Opção C). Testada pela interface no modo dev e no app empacotado (seção 8) | Web Audio + motor JUCE só para aplicar efeito | Concluída |
 | 2 ✅ | **Motor nativo** de reprodução e mixagem (I/O nativo, grafo, transporte). O Web Audio sai do app desktop (seção 4.6) | Nativo | Concluída |
 | 3 ✅ | Plugins **em tempo real** nas cadeias de faixa e master, mais as janelas nativas dos plugins (seção 4.7) | Nativo | Concluída |
-| 4 | Instrumentos virtuais (VSTi) nas faixas MIDI, MIDI I/O de hardware, gravação com compensação de latência | Nativo | Médio |
+| 4 ✅ | Instrumentos virtuais (VSTi) nas faixas MIDI, entrada MIDI de hardware, gravação com compensação de latência (seção 4.8) | Nativo | Concluída |
 | 5 | Recursos de DAW: automação, clips, envios/barramentos, congelar faixa, render em segundo plano | Nativo | Médio |
 
 ```mermaid
@@ -319,7 +319,7 @@ flowchart LR
   F1["Fase 1 ✅<br/>Motor JUCE<br/>varredura + aplicar efeito"]
   F2["Fase 2 ✅<br/>Motor nativo<br/>I/O, grafo, transporte"]
   F3["Fase 3 ✅<br/>Plugins em tempo real<br/>janelas nativas"]
-  F4["Fase 4<br/>VSTi, MIDI de hardware,<br/>latência de gravação"]
+  F4["Fase 4 ✅<br/>VSTi, MIDI de hardware,<br/>latência de gravação"]
   F5["Fase 5<br/>DAW: automação, clips,<br/>barramentos, congelar"]
   F0 --> F1 --> F2 --> F3 --> F4 --> F5
 
@@ -673,7 +673,6 @@ Diferenças conhecidas, todas herdadas do navegador ou intencionais:
 **O que fica para depois:**
 
 - O áudio ainda mora na memória da interface (sem paginação em disco).
-- Faixas com instrumentos virtuais e MIDI de hardware: Fase 4.
 
 ### 4.7 Fase 3: plugins nas cadeias em tempo real (como está implementado)
 
@@ -736,7 +735,76 @@ plugins ficarem carregados e a janela abrir sem precisar tocar.
 | Projeto salvo e reaberto | plugin e estado idênticos |
 | Plugin ausente | aviso e som passando sem efeito |
 
-### 4.8 Ambiente de desenvolvimento (Windows)
+### 4.8 Fase 4: instrumentos virtuais, entrada MIDI e latência da gravação (como está implementado)
+
+**Instrumentos virtuais (VSTi) nas faixas MIDI.** O seletor de instrumento da faixa
+(cabeçalho e piano roll) ganhou **Plugin (VSTi)…**; o botão ao lado abre a janela
+do instrumento. No projeto, a faixa MIDI tem `instrument` (`null` = sintetizador
+embutido, ou um slot de plugin com estado, como os da Fase 3); o estado vai para o
+`.ravenproj` e para o desfazer ("Instrumento ajustado: <nome>"). No navegador, a
+faixa toca o programa General MIDI no sintetizador embutido.
+
+- No motor, o `PluginEffect` tem modo instrumento: sem entradas, saída estéreo, as
+  notas entram como eventos MIDI (note on no início, note off guardado até a hora
+  certa, mesmo em outro bloco). A latência do instrumento entra na compensação (PDC).
+- **O grafo agora roda também com o transporte parado**: clipes e notas do projeto
+  não tocam, mas instrumentos, notas ao vivo e caudas de reverb/eco continuam. Ao
+  parar, as notas soltam com o release (sem corte seco nem nota presa); ao começar
+  a tocar, tudo é cortado e os efeitos zeram. (Na Fase 2, parar silenciava na hora,
+  como o motor Web Audio.)
+- **A nota avulsa do piano roll toca pela própria faixa** (instrumento e efeitos),
+  e não mais por um sintetizador à parte.
+- Render offline com instrumento: o motor processa silêncio por 1 s antes, porque
+  instrumentos carregam amostras em segundo plano (o FluidSynth dos AVL Drumkits
+  fica mudo sem isso).
+
+**Entrada MIDI.** Escolha em **Transporte → Dispositivos de áudio… → MIDI** (lembrada
+entre sessões). O que se toca soa na **faixa MIDI selecionada**, pelo instrumento
+dela. Com uma faixa MIDI selecionada (e nenhuma de áudio), **Gravar (R)** toca o
+projeto a partir do cursor e grava as notas; ao parar, viram notas da faixa
+("Gravado MIDI: N notas").
+
+- O driver MIDI enfileira cada mensagem com o horário de chegada; o thread de áudio
+  a posiciona dentro do bloco pelo atraso (atraso constante de um bloco, espaçamento
+  preservado). O `MidiMessageCollector` do JUCE foi descartado porque perdia
+  mensagens que chegavam entre a leitura do relógio e a entrada na fila.
+- O tempo de cada nota gravada é a posição do transporte menos a latência de saída
+  e a dos plugins: o momento em que o músico ouviu o que acompanhava.
+- `midi.simulate` injeta mensagens no mesmo ponto do driver (testes; esta máquina
+  não tem teclado MIDI).
+
+**Compensação de latência na gravação de áudio.** Ao começar a gravar, o motor
+informa a latência de ida e volta do driver (entrada + saída); ao parar, esse
+trecho do começo do take é descartado, mais um ajuste manual em ms (em
+Dispositivos de áudio → Gravação), para o take ficar alinhado com o que se ouvia.
+
+**Robustez descoberta nesta fase:**
+
+- **Plugins que imprimem no stdout** (o FluidSynth dos AVL Drumkits) corrompiam o
+  canal JSON. O motor agora usa uma cópia privada do stdout para o protocolo e
+  aponta o stdout do processo para o stderr (`Protocol.cpp`).
+- **Destruir a interface de alguns plugins LV2 derruba o processo** (AVL Drumkits no
+  Windows: exceção 0xC000041D dentro da janela). Para LV2, fechar só esconde a
+  janela, e a instância que abriu a interface não é destruída até o motor encerrar
+  (vazamento intencional, `keepEditorAlive` em `PluginWindow.h`). VST3 não muda.
+
+**Comandos novos:** `midi.devices`, `midi.setInput`, `midi.startRecording`,
+`midi.read`, `midi.stopRecording`, `midi.simulate`; `synth.audition` aceita
+`trackId`; `capture.start` devolve `latency`; `project.sync` aceita
+`midiTarget` e `instrument` nas faixas MIDI. O evento `meters` traz `midiIn`.
+
+**Testado** (18/11/2026):
+
+| Teste | Resultado |
+|---|---|
+| Black Pearl Drumkit (LV2) numa faixa MIDI: tocar, nota avulsa, render MIDI → áudio | pico 0,117 ao vivo, 0,466 no render |
+| Parar com nota soando | release natural, silêncio em 0,9 s |
+| Entrada MIDI na faixa selecionada / sem faixa selecionada | toca / não toca |
+| Gravação MIDI (envios em 0,5 s e 1,2 s, 20 ms de latência) | notas em 0,49 e 1,19 s, duração 0,30 s; 5 de 5 rodadas com todos os eventos |
+| Gravação MIDI com R pela interface + desfazer | 2 notas, intervalo e duração certos |
+| Ajuste de 800 ms na compensação da gravação de áudio | take ~0,76 s mais curto |
+
+### 4.9 Ambiente de desenvolvimento (Windows)
 
 | Ferramenta | Para quê |
 |---|---|
@@ -879,7 +947,7 @@ um addon do Node.
    mostrava 2083 parâmetros (2080 eram controladores MIDI internos do VST3).
 
    Para compilar numa máquina nova:
-   1. instalar o ambiente da [seção 4.8](#48-ambiente-de-desenvolvimento-windows);
+   1. instalar o ambiente da [seção 4.9](#49-ambiente-de-desenvolvimento-windows);
    2. depois de clonar o repositório: `git submodule update --init`;
    3. `npm run build:engine` (gera `engine/bin/raven-engine.exe`);
    4. teste rápido sem interface, no Git Bash:

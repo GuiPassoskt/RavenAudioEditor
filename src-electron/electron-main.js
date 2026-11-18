@@ -16,7 +16,8 @@ const ENGINE_COMMANDS = new Set([
   'ping', 'plugins.list', 'fx.create', 'fx.setParam', 'fx.openEditor', 'fx.closeEditor', 'fx.destroy',
   'audio.status', 'audio.devices', 'audio.setDevice', 'project.sync', 'project.setRate', 'clips.release',
   'transport.play', 'transport.stop', 'preview.stop', 'synth.audition', 'capture.start', 'capture.stop',
-  'project.pluginInfo', 'project.setPluginParam', 'project.openPluginEditor', 'project.closePluginEditor'
+  'project.pluginInfo', 'project.setPluginParam', 'project.openPluginEditor', 'project.closePluginEditor',
+  'midi.devices', 'midi.setInput', 'midi.startRecording', 'midi.read', 'midi.stopRecording', 'midi.simulate'
 ])
 const ENGINE_SEND_AUDIO = new Set(['clips.load', 'preview.play'])
 const ENGINE_RECEIVE_AUDIO = new Set(['render.offline', 'capture.read'])

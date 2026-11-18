@@ -26,8 +26,18 @@ NoteList::Ptr NoteList::fromJson (const juce::var& json)
     return list;
 }
 
+bool TrackState::pushLive (LiveEvent e)
+{
+    const auto scope = liveFifo.write (1);
+    if (scope.blockSize1 == 0)
+        return false;
+    liveQueue[(size_t) scope.startIndex1] = e;
+    return true;
+}
+
 void TrackState::prepare (double rate, int maxBlockSize)
 {
+    midi.ensureSize (4096);
     sampleRate = rate;
     scratch.setSize (2, maxBlockSize);
     synth.prepare (rate);
@@ -61,9 +71,14 @@ MixGraph::Ptr MixGraph::build (const juce::var& project, double rate, bool apply
             track.offset = t["offset"];
             track.program = t["program"];
             track.drum = t["drum"];
+            track.isMidi = t["kind"].toString() == "midi";
 
-            if (t["kind"].toString() == "midi")
+            if (track.isMidi)
+            {
                 track.notes = resources.notes (track.id, t);
+                if (t["instrument"].isObject())
+                    track.instrument = resources.instrument (t["instrument"]);
+            }
             else if (t["clip"].isString())
                 track.clip = resources.clip (t["clip"].toString());
 
@@ -92,11 +107,16 @@ MixGraph::Ptr MixGraph::build (const juce::var& project, double rate, bool apply
         return latency;
     };
 
+    const auto trackLatency = [&] (const Track& t)
+    {
+        return chainLatency (t.effects) + (t.instrument != nullptr ? juce::jmax (0, t.instrument->getLatencySamples()) : 0);
+    };
+
     int slowest = 0;
     for (const auto& t : graph->tracks)
-        slowest = juce::jmax (slowest, chainLatency (t.effects));
+        slowest = juce::jmax (slowest, trackLatency (t));
     for (auto& t : graph->tracks)
-        t.compensation = juce::jmin (slowest - chainLatency (t.effects), t.state->delayLine.getNumSamples() - 1);
+        t.compensation = juce::jmin (slowest - trackLatency (t), t.state->delayLine.getNumSamples() - 1);
 
     if (applyMaster)
     {
@@ -109,6 +129,9 @@ MixGraph::Ptr MixGraph::build (const juce::var& project, double rate, bool apply
     }
 
     graph->totalLatency = slowest + chainLatency (graph->masterEffects);
+    graph->midiTarget = graph->trackIndex (project["midiTarget"].toString());
+    if (graph->midiTarget >= 0 && ! graph->tracks[(size_t) graph->midiTarget].isMidi)
+        graph->midiTarget = -1;
     return graph;
 }
 
@@ -121,12 +144,100 @@ void MixGraph::locate (juce::int64)
         t.state->snapGains = true;
         t.state->delayLine.clear();
         t.state->delayIndex = 0;
+        t.state->panic = true;
+        if (t.instrument != nullptr)
+            t.instrument->reset();
         for (auto& fx : t.effects)
             fx->reset();
     }
 
     for (auto& fx : masterEffects)
         fx->reset();
+}
+
+void MixGraph::releaseNotes()
+{
+    for (auto& t : tracks)
+        t.state->releaseRequested = true;
+}
+
+int MixGraph::trackIndex (const juce::String& id) const
+{
+    for (size_t i = 0; i < tracks.size(); ++i)
+        if (tracks[i].id == id)
+            return (int) i;
+    return -1;
+}
+
+// Eventos MIDI do bloco: pedidos de soltar/cortar, "note off" pendentes dos
+// instrumentos e notas ao vivo. Com o sintetizador embutido, viram chamadas a ele.
+void MixGraph::collectMidi (Track& t, int numSamples, juce::int64 position, bool running, const juce::MidiBuffer* live)
+{
+    auto& st = *t.state;
+    auto& midi = st.midi;
+
+    if (st.panic || st.releaseRequested)
+    {
+        for (int i = 0; i < st.numPendingOffs; ++i)
+            midi.addEvent (juce::MidiMessage::noteOff (1, st.pendingOffs[(size_t) i].pitch), 0);
+        st.numPendingOffs = 0;
+
+        if (t.instrument != nullptr)
+            midi.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+        else if (st.panic)
+            st.synth.allNotesOff();
+        else
+            st.synth.releaseAll();
+
+        st.panic = st.releaseRequested = false;
+    }
+
+    if (running)
+    {
+        // "Note off" das notas do projeto que terminam neste bloco.
+        for (int i = 0; i < st.numPendingOffs;)
+        {
+            const auto& off = st.pendingOffs[(size_t) i];
+            if (off.sample < position + numSamples)
+            {
+                midi.addEvent (juce::MidiMessage::noteOff (1, off.pitch), (int) juce::jmax<juce::int64> (0, off.sample - position));
+                st.pendingOffs[(size_t) i] = st.pendingOffs[(size_t) --st.numPendingOffs];
+            }
+            else
+            {
+                ++i;
+            }
+        }
+    }
+
+    // Notas ao vivo: as que caem neste bloco entram; as outras esperam.
+    {
+        const auto scope = st.liveFifo.read (st.liveFifo.getNumReady());
+        scope.forEach ([&] (int index)
+        {
+            if (st.numDelayed < (int) st.delayed.size())
+                st.delayed[(size_t) st.numDelayed++] = st.liveQueue[(size_t) index];
+        });
+    }
+
+    for (int i = 0; i < st.numDelayed;)
+    {
+        auto& e = st.delayed[(size_t) i];
+        if (e.delay < numSamples)
+        {
+            midi.addEvent (juce::MidiMessage (e.status, e.data1, e.data2), e.delay);
+            st.delayed[(size_t) i] = st.delayed[(size_t) --st.numDelayed];
+        }
+        else
+        {
+            e.delay -= numSamples;
+            ++i;
+        }
+    }
+
+    // Teclado/controlador MIDI (só na faixa alvo).
+    if (live != nullptr)
+        midi.addEvents (*live, 0, numSamples, 0);
 }
 
 void MixGraph::scheduleNotes (Track& t, int numSamples, juce::int64 position, juce::int64 end)
@@ -139,8 +250,19 @@ void MixGraph::scheduleNotes (Track& t, int numSamples, juce::int64 position, ju
     const auto trigger = [&] (const NoteList::Note& n, juce::int64 from)
     {
         const auto until = juce::jmin (toSample (n.end), end);
-        if (until - from > minLength)
+        if (until - from <= minLength)
+            return;
+
+        if (t.instrument == nullptr)
+        {
             st.synth.noteOn (n.pitch, n.velocity, t.program, t.drum, (int) (from - position), until - from);
+        }
+        else if (st.numPendingOffs < (int) st.pendingOffs.size())
+        {
+            st.midi.addEvent (juce::MidiMessage::noteOn (1, n.pitch, (juce::uint8) juce::jlimit (1, 127, n.velocity)),
+                              (int) (from - position));
+            st.pendingOffs[(size_t) st.numPendingOffs++] = { until, n.pitch };
+        }
     };
 
     // Reposiciona o cursor: no início da reprodução (as notas que já soam tocam
@@ -170,15 +292,16 @@ void MixGraph::scheduleNotes (Track& t, int numSamples, juce::int64 position, ju
 }
 
 void MixGraph::render (juce::AudioBuffer<float>& out, int numSamples, juce::int64 position, juce::int64 end,
-                       MasterState& master)
+                       MasterState& master, bool running, const juce::MidiBuffer* midiInput)
 {
-    for (auto& t : tracks)
+    for (size_t index = 0; index < tracks.size(); ++index)
     {
+        auto& t = tracks[index];
         auto& st = *t.state;
         auto& buf = st.scratch;
         buf.clear (0, numSamples);
 
-        if (t.clip != nullptr)
+        if (running && t.clip != nullptr)
         {
             // Mono vira estéreo (L = R) antes dos efeitos, como o upmix de createVoice().
             const auto& audio = t.clip->audio;
@@ -192,10 +315,31 @@ void MixGraph::render (juce::AudioBuffer<float>& out, int numSamples, juce::int6
                                   (int) (from - clipStart), (int) (to - from));
         }
 
-        if (t.notes != nullptr)
+        if (t.isMidi)
         {
-            scheduleNotes (t, numSamples, position, end);
-            st.synth.render (buf, numSamples);
+            st.midi.clear();
+            collectMidi (t, numSamples, position, running, (int) index == midiTarget ? midiInput : nullptr);
+            if (running && t.notes != nullptr)
+                scheduleNotes (t, numSamples, position, end);
+
+            if (t.instrument != nullptr)
+            {
+                t.instrument->renderInstrument (buf, numSamples, st.midi);
+            }
+            else
+            {
+                // Sintetizador embutido: os eventos ao vivo viram notas sem fim / note off.
+                for (const auto meta : st.midi)
+                {
+                    const auto msg = meta.getMessage();
+                    if (msg.isNoteOn())
+                        st.synth.noteOn (msg.getNoteNumber(), msg.getVelocity(), t.program, t.drum,
+                                         meta.samplePosition, Synth::untilNoteOff);
+                    else if (msg.isNoteOff())
+                        st.synth.noteOff (msg.getNoteNumber(), meta.samplePosition);
+                }
+                st.synth.render (buf, numSamples);
+            }
         }
 
         for (auto& fx : t.effects)

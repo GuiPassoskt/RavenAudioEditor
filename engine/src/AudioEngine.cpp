@@ -109,7 +109,7 @@ public:
         usedEffects.insert (uid);
 
         if (type == "plugin")
-            return pluginEffect (uid, state);
+            return pluginEffect (uid, state, false);
 
         auto& fx = engine.effects[uid];
         if (fx != nullptr && fx->type == type && fx->getSampleRate() == rate)
@@ -127,14 +127,23 @@ public:
         return fx;
     }
 
-    // Plugin numa cadeia: reaproveita a instância enquanto o plugin e a taxa não mudarem.
-    RealtimeEffect::Ptr pluginEffect (const juce::String& uid, const juce::var& state)
+    PluginEffect::Ptr instrument (const juce::var& state) override
+    {
+        const auto uid = state["uid"].toString();
+        usedEffects.insert (uid);
+        return dynamic_cast<PluginEffect*> (pluginEffect (uid, state, true).get());
+    }
+
+    // Plugin numa cadeia (ou instrumento de faixa MIDI): reaproveita a instância
+    // enquanto o plugin e a taxa não mudarem.
+    RealtimeEffect::Ptr pluginEffect (const juce::String& uid, const juce::var& state, bool isInstrument)
     {
         const auto pluginId = state["pluginId"].toString();
         auto& fx = engine.effects[uid];
         auto* existing = dynamic_cast<PluginEffect*> (fx.get());
 
-        if (existing == nullptr || existing->pluginId != pluginId || existing->getSampleRate() != rate)
+        if (existing == nullptr || existing->pluginId != pluginId || existing->getSampleRate() != rate
+            || existing->instrument != isInstrument)
         {
             // Plugin que já falhou não é carregado de novo a cada mudança do projeto.
             if (engine.failedPlugins.count (uid) && engine.failedPlugins[uid] == pluginId)
@@ -151,7 +160,7 @@ public:
             }
 
             engine.failedPlugins.erase (uid);
-            PluginEffect::Ptr created = new PluginEffect (uid, pluginId, std::move (instance), false);
+            PluginEffect::Ptr created = new PluginEffect (uid, pluginId, std::move (instance), false, isInstrument);
             created->onLatencyChanged = [e = &engine] { e->rebuildGraph(); };
             created->setState ({}, state["enabled"]);
             applyPluginState (*created, state);
@@ -236,7 +245,7 @@ public:
     RealtimeEffect::Ptr effect (const juce::var& state) override
     {
         if (state["type"].toString() == "plugin")
-            return pluginEffect (state);
+            return pluginEffect (state, false);
 
         auto fx = RealtimeEffect::create (state["type"].toString());
         if (fx != nullptr)
@@ -248,12 +257,17 @@ public:
         return fx;
     }
 
+    PluginEffect::Ptr instrument (const juce::var& state) override
+    {
+        return dynamic_cast<PluginEffect*> (pluginEffect (state, true).get());
+    }
+
     std::vector<RealtimeEffect::Ptr> created;
 
 private:
     // Instância nova do plugin, com o estado da instância ao vivo se ela existir
     // (pega ajustes feitos há menos de 400 ms, que a interface ainda não recebeu).
-    RealtimeEffect::Ptr pluginEffect (const juce::var& state)
+    RealtimeEffect::Ptr pluginEffect (const juce::var& state, bool isInstrument)
     {
         const auto uid = state["uid"].toString();
         juce::String error;
@@ -264,7 +278,7 @@ private:
             return nullptr;
         }
 
-        PluginEffect::Ptr fx = new PluginEffect (uid, state["pluginId"].toString(), std::move (instance), true);
+        PluginEffect::Ptr fx = new PluginEffect (uid, state["pluginId"].toString(), std::move (instance), true, isInstrument);
         fx->setState ({}, state["enabled"]);
 
         const auto it = engine.effects.find (uid);
@@ -300,13 +314,16 @@ AudioEngine::AudioEngine (juce::File settings, PluginHost& pluginHost)
 AudioEngine::~AudioEngine()
 {
     stopTimer();
+    if (midiInput != nullptr)
+        midiInput->stop();
+    midiInput.reset();
     deviceManager.removeAudioCallback (this);
     deviceManager.closeAudioDevice();
 }
 
 bool AudioEngine::handles (const juce::String& cmd)
 {
-    for (auto* prefix : { "audio.", "project.", "clips.", "transport.", "preview.", "synth.", "render.", "capture." })
+    for (auto* prefix : { "audio.", "project.", "clips.", "transport.", "preview.", "synth.", "render.", "capture.", "midi." })
         if (cmd.startsWith (prefix))
             return true;
     return false;
@@ -334,6 +351,12 @@ juce::var AudioEngine::handle (const juce::String& cmd, const juce::var& message
     if (cmd == "project.setPluginParam")    return setPluginParam (message);
     if (cmd == "project.openPluginEditor")  return openPluginEditor (message);
     if (cmd == "project.closePluginEditor") return closePluginEditor (message);
+    if (cmd == "midi.devices")              return midiDevices();
+    if (cmd == "midi.setInput")             return setMidiInput (message);
+    if (cmd == "midi.startRecording")       return startMidiRecording();
+    if (cmd == "midi.read")                 return readMidiRecording();
+    if (cmd == "midi.stopRecording")        return stopMidiRecording();
+    if (cmd == "midi.simulate")             return simulateMidi (message);
 
     throw CommandError ("Comando desconhecido: " + cmd);
 }
@@ -478,6 +501,95 @@ PluginEffect& AudioEngine::livePlugin (const juce::var& message)
                                                   : "Plugin não encontrado no motor.");
 }
 
+//==============================================================================
+juce::var AudioEngine::midiDevices()
+{
+    juce::Array<juce::var> inputs;
+    for (const auto& device : juce::MidiInput::getAvailableDevices())
+        inputs.add (juce::var (object ({ { "id", device.identifier }, { "name", device.name } }).get()));
+
+    return juce::var (object ({ { "inputs", inputs }, { "current", midiInputId } }).get());
+}
+
+juce::var AudioEngine::setMidiInput (const juce::var& message)
+{
+    const auto id = message["id"].toString();
+    if (id == midiInputId && (id.isEmpty() || midiInput != nullptr))
+        return true;
+
+    if (midiInput != nullptr)
+        midiInput->stop();
+    midiInput.reset();
+    midiInputId = {};
+
+    if (id.isNotEmpty())
+    {
+        midiInput = juce::MidiInput::openDevice (id, this);
+        if (midiInput == nullptr)
+            throw CommandError ("Não foi possível abrir a entrada MIDI.");
+        midiInput->start();
+        midiInputId = id;
+    }
+    return true;
+}
+
+void AudioEngine::queueMidi (const juce::MidiMessage& message)
+{
+    if (message.getRawDataSize() > 3 || message.isSysEx())
+        return;
+
+    const auto* raw = message.getRawData();
+    const IncomingMidi e { raw[0], message.getRawDataSize() > 1 ? raw[1] : (juce::uint8) 0,
+                           message.getRawDataSize() > 2 ? raw[2] : (juce::uint8) 0,
+                           juce::Time::getMillisecondCounterHiRes() * 0.001 };
+
+    const juce::SpinLock::ScopedLockType lock (midiQueueLock);
+    const auto scope = midiQueueFifo.write (1);
+    if (scope.blockSize1 > 0)
+        midiQueue[(size_t) scope.startIndex1] = e;
+}
+
+void AudioEngine::handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage& message)
+{
+    queueMidi (message);
+}
+
+// Só para testes: injeta uma mensagem como se viesse do dispositivo MIDI.
+juce::var AudioEngine::simulateMidi (const juce::var& message)
+{
+    queueMidi (juce::MidiMessage ((int) message["status"], (int) message["data1"], (int) message["data2"]));
+    return true;
+}
+
+juce::var AudioEngine::startMidiRecording()
+{
+    midiRecordFifo.reset();
+    midiRecording.store (true);
+    return true;
+}
+
+// Eventos gravados desde a última leitura: tempo em segundos do projeto (já
+// descontada a latência de saída: é o momento em que o músico ouviu).
+juce::var AudioEngine::readMidiRecording()
+{
+    juce::Array<juce::var> events;
+    const double rate = projectRate.load();
+    const auto scope = midiRecordFifo.read (midiRecordFifo.getNumReady());
+    scope.forEach ([&] (int index)
+    {
+        const auto& e = midiRecordQueue[(size_t) index];
+        events.add (juce::var (object ({ { "t", (double) e.sample / rate }, { "status", (int) e.status },
+                                         { "data1", (int) e.data1 }, { "data2", (int) e.data2 } }).get()));
+    });
+    return events;
+}
+
+juce::var AudioEngine::stopMidiRecording()
+{
+    midiRecording.store (false);
+    return readMidiRecording();
+}
+
 juce::var AudioEngine::pluginInfo (const juce::var& message)
 {
     return livePlugin (message).info();
@@ -576,6 +688,21 @@ juce::var AudioEngine::stopPreview()
 
 juce::var AudioEngine::audition (const juce::var& message)
 {
+    // Com a faixa informada, a nota toca pela própria faixa (instrumento e efeitos).
+    if (message.hasProperty ("trackId") && graph != nullptr)
+    {
+        const int index = graph->trackIndex (message["trackId"].toString());
+        if (index >= 0 && graph->tracks[(size_t) index].isMidi)
+        {
+            auto& st = *graph->tracks[(size_t) index].state;
+            const auto pitch = (juce::uint8) juce::jlimit (0, 127, (int) message["pitch"]);
+            const auto velocity = (juce::uint8) juce::jlimit (1, 127, (int) message.getProperty ("vel", 100));
+            st.pushLive ({ 0x90, pitch, velocity, 0 });
+            st.pushLive ({ 0x80, pitch, 0, (int) (auditionSeconds * projectRate.load()) });
+            return true;
+        }
+    }
+
     const AuditionNote note { message["pitch"], message.getProperty ("vel", 100), message["program"], message["drum"] };
     const auto scope = auditionFifo.write (1);
     if (scope.blockSize1 > 0)
@@ -671,7 +798,13 @@ juce::var AudioEngine::startCapture (const juce::var&)
         interpolator.reset();
 
     capturing.store (true);
-    return juce::var (object ({ { "deviceRate", deviceRate.load() } }).get());
+
+    // Latência de ida e volta informada pelo driver: o take sai atrasado por ela.
+    double latency = 0;
+    if (auto* device = deviceManager.getCurrentAudioDevice())
+        latency = (device->getInputLatencyInSamples() + device->getOutputLatencyInSamples()) / device->getCurrentSampleRate();
+
+    return juce::var (object ({ { "deviceRate", deviceRate.load() }, { "latency", latency } }).get());
 }
 
 juce::var AudioEngine::readCapture (const juce::var& message)
@@ -827,7 +960,54 @@ void AudioEngine::renderProject (juce::AudioBuffer<float>& mix, int numSamples)
         masterState.snap = true;
     }
 
-    if (playing.load() && audioGraph != nullptr && audioGraph->sampleRate == rate)
+    // Entrada MIDI deste bloco (teclado/controlador). Cada mensagem fica na posição
+    // proporcional ao tempo desde que chegou: o atraso é de um bloco, igual para
+    // todas, e o espaçamento entre elas se mantém.
+    midiBlock.clear();
+    if (midiQueueFifo.getNumReady() > 0)
+    {
+        const double now = juce::Time::getMillisecondCounterHiRes() * 0.001;
+        const auto scope = midiQueueFifo.read (midiQueueFifo.getNumReady());
+        scope.forEach ([&] (int index)
+        {
+            const auto& e = midiQueue[(size_t) index];
+            const int lag = (int) ((now - e.time) * rate);
+            midiBlock.addEvent (juce::MidiMessage (e.status, e.data1, e.data2),
+                                juce::jlimit (0, numSamples - 1, numSamples - 1 - lag));
+        });
+        midiActivity.store (true);
+    }
+
+    // Gravação MIDI: posição do transporte menos o que o músico ouviu atrasado
+    // (latência de saída do dispositivo e dos plugins).
+    if (midiRecording.load() && playing.load() && ! midiBlock.isEmpty())
+    {
+        const auto heardDelay = (juce::int64) std::llround (outputLatency.load() * rate)
+                              + (audioGraph != nullptr ? audioGraph->totalLatency : 0);
+        const auto blockStart = position.load();
+        for (const auto meta : midiBlock)
+        {
+            const auto msg = meta.getMessage();
+            if (! (msg.isNoteOnOrOff() || msg.isSustainPedalOn() || msg.isSustainPedalOff()))
+                continue;
+            const auto scope = midiRecordFifo.write (1);
+            if (scope.blockSize1 > 0)
+                midiRecordQueue[(size_t) scope.startIndex1] = { blockStart + meta.samplePosition - heardDelay,
+                                                               msg.getRawData()[0], msg.getRawData()[1], msg.getRawData()[2] };
+        }
+    }
+
+    // Parou: as notas soltam com o release (instrumentos e sintetizador).
+    const bool isPlaying = playing.load();
+    if (audioWasPlaying && ! isPlaying && audioGraph != nullptr)
+        audioGraph->releaseNotes();
+    audioWasPlaying = isPlaying;
+
+    // Parado, o grafo continua: notas ao vivo, instrumentos e caudas de efeitos.
+    if (! isPlaying && audioGraph != nullptr && audioGraph->sampleRate == rate)
+        audioGraph->render (mix, numSamples, position.load(), playEnd.load(), masterState, false, &midiBlock);
+
+    if (isPlaying && audioGraph != nullptr && audioGraph->sampleRate == rate)
     {
         // Continua depois do fim pelo tempo da latência dos plugins, para o final sair inteiro.
         auto pos = position.load();
@@ -835,7 +1015,7 @@ void AudioEngine::renderProject (juce::AudioBuffer<float>& mix, int numSamples)
         const auto stopAt = end + audioGraph->totalLatency;
         const int n = (int) juce::jlimit<juce::int64> (0, numSamples, stopAt - pos);
         if (n > 0)
-            audioGraph->render (mix, n, pos, end, masterState);
+            audioGraph->render (mix, n, pos, end, masterState, true, &midiBlock);
 
         pos += n;
         position.store (pos);
@@ -888,7 +1068,9 @@ void AudioEngine::timerCallback()
     if (ended.exchange (false))
         sendEvent ("transport.ended", object ({ { "position", (double) playEnd.load() / projectRate.load() } }));
 
-    const bool active = playing.load() || capturing.load();
+    // Parado também pode haver som (notas ao vivo, caudas de efeitos).
+    const bool sounding = masterPeakL.load() > 1.0e-4f || masterPeakR.load() > 1.0e-4f || midiActivity.load();
+    const bool active = playing.load() || capturing.load() || sounding;
     if (! active && ! wasActive)
     {
         masterPeakL.store (0);
@@ -918,6 +1100,7 @@ void AudioEngine::timerCallback()
                                    { "position", heard / rate },
                                    { "master", master },
                                    { "input", inputPeak.exchange (0) },
+                                   { "midiIn", midiActivity.exchange (false) },
                                    { "tracks", juce::var (tracks.get()) } }));
 }
 

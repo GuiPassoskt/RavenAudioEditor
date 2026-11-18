@@ -53,3 +53,28 @@ export function quantize (notes, grid, ids = null, durations = false) {
     return { ...n, start: Math.max(0, start), dur }
   })
 }
+
+// Notas a partir de eventos MIDI gravados ({ t, status, data1, data2 }, t em
+// segundos do projeto). Notas sem "note off" terminam em `end`. Tempos relativos
+// ao início da faixa (offset); o que cai antes dela é descartado.
+export function notesFromMidiEvents (events, offset, end) {
+  const open = new Map()
+  const notes = []
+  const close = (pitch, t) => {
+    const n = open.get(pitch)
+    if (!n) return
+    open.delete(pitch)
+    if (t - n.t > 0.01 && n.t >= offset) notes.push({ id: noteId(), pitch, start: n.t - offset, dur: t - n.t, vel: n.vel })
+  }
+  for (const e of [...events].sort((a, b) => a.t - b.t)) {
+    const type = e.status & 0xF0
+    if (type === 0x90 && e.data2 > 0) {
+      close(e.data1, e.t)
+      open.set(e.data1, { t: e.t, vel: e.data2 })
+    } else if (type === 0x80 || type === 0x90) {
+      close(e.data1, e.t)
+    }
+  }
+  for (const pitch of [...open.keys()]) close(pitch, end)
+  return sortNotes(notes)
+}

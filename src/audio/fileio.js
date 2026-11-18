@@ -55,6 +55,7 @@ export function encodeProject (project) {
       ? {
           kind: 'midi', name: t.name, color: t.color, offset: t.offset, gain: t.gain, pan: t.pan, mute: t.mute, solo: t.solo,
           program: t.program, drum: t.drum, channels: 0, length: 0,
+          instrument: t.instrument ? { plugin: t.instrument.plugin, state: t.instrument.state } : null,
           effects: (t.effects ?? []).map(effectJson),
           notes: t.notes.map(({ pitch, start, dur, vel }) => ({ pitch, start, dur, vel }))
         }

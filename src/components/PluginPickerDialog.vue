@@ -2,7 +2,7 @@
   <q-dialog :model-value="modelValue" @update:model-value="v => emit('update:modelValue', v)">
     <q-card dark class="picker-card">
       <q-card-section class="row items-center q-pb-none">
-        <div class="text-h6">Adicionar plugin</div>
+        <div class="text-h6">{{ instruments ? 'Instrumento virtual (VSTi)' : 'Adicionar plugin' }}</div>
         <q-space />
         <q-btn v-close-popup flat round dense icon="close" />
       </q-card-section>
@@ -10,7 +10,7 @@
       <q-card-section class="q-gutter-y-sm">
         <div class="row items-center no-wrap q-gutter-x-sm">
           <q-select
-            v-model="selected" :options="filtered" label="Plugin de efeito (VST3 / LV2)" class="col"
+            v-model="selected" :options="filtered" :label="instruments ? 'Instrumento (VST3 / LV2)' : 'Plugin de efeito (VST3 / LV2)'" class="col"
             emit-value map-options use-input input-debounce="0" dense dark outlined
             :loading="loading" :disable="scanning" @filter="onFilter"
           >
@@ -23,27 +23,29 @@
           </q-btn>
         </div>
         <div class="text-caption text-grey-6">
-          O plugin entra no fim da cadeia e processa ao tocar e ao exportar, sem alterar o áudio da faixa.
+          <template v-if="instruments">As notas da faixa passam a tocar neste instrumento, em vez do sintetizador embutido.</template>
+          <template v-else>O plugin entra no fim da cadeia e processa ao tocar e ao exportar, sem alterar o áudio da faixa.</template>
         </div>
       </q-card-section>
 
       <q-card-actions align="right">
         <q-btn v-close-popup flat label="Cancelar" color="grey-5" />
-        <q-btn unelevated label="Adicionar" color="primary" :disable="!selected" @click="pick" />
+        <q-btn unelevated :label="instruments ? 'Usar' : 'Adicionar'" color="primary" :disable="!selected" @click="pick" />
       </q-card-actions>
     </q-card>
   </q-dialog>
 </template>
 
 <script setup>
-// Escolha de um plugin VST3/LV2 para uma cadeia de efeitos em tempo real (Fase 3).
-// A lista é a mesma do diálogo Efeito → Plugin… (varredura do motor nativo).
+// Escolha de um plugin VST3/LV2: efeito para uma cadeia em tempo real (Fase 3) ou,
+// com `instruments`, instrumento virtual de uma faixa MIDI (Fase 4). A lista é a
+// mesma do diálogo Efeito → Plugin… (varredura do motor nativo).
 
 import { computed, ref, watch } from 'vue'
 import { nativePlugins } from 'src/audio/plugins'
 import { notifyError } from 'src/composables/commands'
 
-const props = defineProps({ modelValue: Boolean })
+const props = defineProps({ modelValue: Boolean, instruments: Boolean })
 const emit = defineEmits(['update:modelValue', 'pick'])
 
 const plugins = ref([])
@@ -53,7 +55,7 @@ const loading = ref(false)
 const scanning = ref(false)
 
 const options = computed(() => plugins.value
-  .filter(p => !p.isInstrument)
+  .filter(p => !!p.isInstrument === props.instruments)
   .map(p => ({ label: `${p.name} — ${p.vendor || 'desconhecido'} (${p.format})`, value: p.id }))
   .sort((a, b) => a.label.localeCompare(b.label)))
 const filtered = computed(() => {

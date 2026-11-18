@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { parseMidi, writeMidi, pitchName } from '../src/audio/midifile.js'
-import { clipNotes, insertNotes, notesEnd, quantize, removeRange } from '../src/audio/notes.js'
+import { clipNotes, insertNotes, notesEnd, notesFromMidiEvents, quantize, removeRange } from '../src/audio/notes.js'
 import { decodeProject, encodeProject } from '../src/audio/fileio.js'
 
 const close = (a, b, eps = 1e-3) => assert.ok(Math.abs(a - b) < eps, `${a} != ${b}`)
@@ -97,4 +97,33 @@ test('projeto .ravenproj guarda faixas MIDI e o andamento', async () => {
 test('nomes de nota', () => {
   assert.equal(pitchName(60), 'C4')
   assert.equal(pitchName(69), 'A4')
+})
+
+test('gravação MIDI: eventos viram notas relativas à faixa', () => {
+  const ev = (t, status, data1, data2) => ({ t, status, data1, data2 })
+  const notes = notesFromMidiEvents([
+    ev(1.2, 0x90, 67, 90), // sol, fecha com note on de velocidade 0
+    ev(1.0, 0x90, 60, 100), // dó (fora de ordem: a lista é ordenada)
+    ev(1.3, 0x80, 60, 0),
+    ev(1.5, 0x90, 67, 0),
+    ev(1.6, 0x90, 64, 80), // mi sem note off: termina no fim da gravação
+    ev(0.2, 0x90, 72, 100), // antes do início da faixa: descartada
+    ev(0.4, 0x80, 72, 0)
+  ], 0.5, 2)
+  assert.equal(notes.length, 3)
+  const [c, g, e] = notes
+  assert.equal(c.pitch, 60); close(c.start, 0.5); close(c.dur, 0.3); assert.equal(c.vel, 100)
+  assert.equal(g.pitch, 67); close(g.start, 0.7); close(g.dur, 0.3)
+  assert.equal(e.pitch, 64); close(e.start, 1.1); close(e.dur, 0.4)
+})
+
+test('gravação MIDI: nota repetida sem note off fecha a anterior', () => {
+  const notes = notesFromMidiEvents([
+    { t: 0, status: 0x90, data1: 60, data2: 100 },
+    { t: 0.5, status: 0x90, data1: 60, data2: 100 },
+    { t: 0.8, status: 0x80, data1: 60, data2: 0 }
+  ], 0, 1)
+  assert.equal(notes.length, 2)
+  close(notes[0].dur, 0.5)
+  close(notes[1].dur, 0.3)
 })

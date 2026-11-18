@@ -92,9 +92,13 @@
 
       <div v-if="track.kind === 'midi'" class="row items-center no-wrap q-gutter-x-xs midi-row">
         <q-select
-          :model-value="track.drum ? 128 : Math.floor(track.program / 8) * 8" :options="INSTRUMENTS"
+          :model-value="instrumentValue(track)" :options="instrumentOptions(track)"
           emit-value map-options dense dark options-dense borderless class="col instrument"
-          @update:model-value="v => store.setInstrument(track.id, v)"
+          @update:model-value="v => chooseInstrument(track, v)"
+        />
+        <q-btn
+          v-if="track.instrument" flat dense size="sm" icon="open_in_new" color="grey-4"
+          title="Abrir a janela do instrumento" @click="openInstrument(track)"
         />
         <q-btn flat dense size="sm" icon="mdi-piano" color="positive" title="Abrir no piano roll (F7)" @click="ui.pianoRoll = track.id" />
       </div>
@@ -112,7 +116,7 @@
 import { computed } from 'vue'
 import { useProjectStore } from 'src/stores/project'
 import { useUiStore } from 'src/stores/ui'
-import { INSTRUMENTS } from 'src/audio/synth'
+import { useInstrumentChoice } from 'src/composables/instruments'
 import { TRACK_COLORS, rgba, shade } from 'src/audio/colors'
 import WaveformCanvas from './WaveformCanvas.vue'
 
@@ -123,6 +127,7 @@ const props = defineProps({
 })
 
 const store = useProjectStore()
+const { instrumentValue, instrumentOptions, chooseInstrument, openInstrument } = useInstrumentChoice()
 const ui = useUiStore()
 const activeFx = computed(() => props.track.effects.some(e => e.enabled))
 const isRec = computed(() => !!store.recTake?.ids.includes(props.track.id))

@@ -18,7 +18,12 @@ public:
     // offset: amostras a partir do início do próximo bloco; length: duração em
     // amostras até o "note off" (a bateria ignora).
     void noteOn (int pitch, int velocity, int program, bool drum, int offset, juce::int64 length);
-    void allNotesOff();
+    // Notas ao vivo (teclado MIDI, nota avulsa): começam sem fim e soltam aqui.
+    void noteOff (int pitch, int offset);
+    void releaseAll();   // solta tudo com o release normal (transporte parou)
+    void allNotesOff();  // corta tudo (início da reprodução)
+
+    static constexpr juce::int64 untilNoteOff = juce::int64 (1) << 40;
 
     // Soma a saída (mono, nos dois canais) em out[0..numSamples).
     void render (juce::AudioBuffer<float>& out, int numSamples);
@@ -41,6 +46,7 @@ private:
         juce::uint32 noiseSeed = 1;
     };
 
+    void release (Voice& v, juce::int64 at);
     float renderTonal (Voice& v);
     float renderDrum (Voice& v);
     static float noise (Voice& v);

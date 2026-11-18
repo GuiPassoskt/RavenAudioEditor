@@ -10,12 +10,13 @@ static constexpr int stateDebounceMs = 400;
 static constexpr int maxTextLength = 64;
 
 PluginEffect::PluginEffect (juce::String uidIn, juce::String pluginIdIn,
-                            std::unique_ptr<juce::AudioPluginInstance> pluginIn, bool isOffline)
+                            std::unique_ptr<juce::AudioPluginInstance> pluginIn, bool isOffline, bool isInstrument)
     : RealtimeEffect ("plugin", {}),
       uid (std::move (uidIn)),
       pluginId (std::move (pluginIdIn)),
       plugin (std::move (pluginIn)),
-      offline (isOffline)
+      offline (isOffline),
+      instrument (isInstrument)
 {
     // Estado de fábrica: é para onde o desfazer volta quando o projeto não tem estado guardado.
     initialState = lastState = currentState();
@@ -29,26 +30,67 @@ PluginEffect::~PluginEffect()
 {
     stopTimer();
     cancelPendingUpdate();
-    window.reset();  // o editor precisa sumir antes do plugin
 
     if (! offline)
         plugin->removeListener (this);
 
+    if (window != nullptr && keepEditorAlive (*plugin))
+    {
+        // Ver keepEditorAlive(): a janela e a instância ficam vivas até o motor encerrar.
+        window->setVisible (false);
+        window.release();
+        plugin->releaseResources();
+        plugin.release();
+        return;
+    }
+
+    window.reset();  // o editor precisa sumir antes do plugin
     plugin->releaseResources();
 }
 
 //==============================================================================
 void PluginEffect::prepareEffect (int maxBlockSize)
 {
-    // Estéreo de preferência; plugin só mono recebe (L + R) / 2 e devolve nos dois canais.
-    stereo = configureLayout (*plugin, 2);
-    if (! stereo && ! configureLayout (*plugin, 1))
-        stereo = plugin->getMainBusNumInputChannels() >= 2;
+    blockSize = maxBlockSize;
+
+    if (instrument)
+    {
+        // Instrumento: sem entradas de áudio, saída estéreo.
+        auto layout = plugin->getBusesLayout();
+        for (auto& bus : layout.inputBuses)
+            bus = juce::AudioChannelSet::disabled();
+        if (! layout.outputBuses.isEmpty())
+            layout.outputBuses.getReference (0) = juce::AudioChannelSet::stereo();
+        if (plugin->checkBusesLayoutSupported (layout))
+            plugin->setBusesLayout (layout);
+    }
+    else
+    {
+        // Estéreo de preferência; plugin só mono recebe (L + R) / 2 e devolve nos dois canais.
+        stereo = configureLayout (*plugin, 2);
+        if (! stereo && ! configureLayout (*plugin, 1))
+            stereo = plugin->getMainBusNumInputChannels() >= 2;
+    }
 
     plugin->setNonRealtime (offline);
     plugin->prepareToPlay (sampleRate, maxBlockSize);
     io.setSize (juce::jmax (plugin->getTotalNumInputChannels(), plugin->getTotalNumOutputChannels(), 2), maxBlockSize);
     lastLatency = plugin->getLatencySamples();
+}
+
+void PluginEffect::waitUntilReady()
+{
+    if (! instrument)
+        return;
+
+    juce::AudioBuffer<float> silence (2, blockSize);
+    juce::MidiBuffer none;
+    for (int i = 0; i < 20; ++i)
+    {
+        renderInstrument (silence, blockSize, none);
+        juce::Thread::sleep (50);
+    }
+    plugin->reset();
 }
 
 void PluginEffect::resetEffect()
@@ -87,6 +129,21 @@ void PluginEffect::processEffect (juce::AudioBuffer<float>& buffer, int numSampl
     buffer.copyFrom (1, 0, io, outputs >= 2 ? 1 : 0, 0, numSamples);
 }
 
+void PluginEffect::renderInstrument (juce::AudioBuffer<float>& out, int numSamples, juce::MidiBuffer& events)
+{
+    const juce::ScopedTryLock lock (plugin->getCallbackLock());
+    if (! lock.isLocked() || plugin->isSuspended())
+        return;
+
+    io.setSize (io.getNumChannels(), numSamples, false, false, true);
+    io.clear();
+    plugin->processBlock (io, events);
+
+    const int outputs = plugin->getMainBusNumOutputChannels();
+    out.copyFrom (0, 0, io, 0, 0, numSamples);
+    out.copyFrom (1, 0, io, outputs >= 2 ? 1 : 0, 0, numSamples);
+}
+
 //==============================================================================
 juce::String PluginEffect::currentState()
 {
@@ -117,7 +174,7 @@ juce::var PluginEffect::info()
     return juce::var (object ({ { "name", plugin->getName() },
                                 { "latency", plugin->getLatencySamples() },
                                 { "hasEditor", plugin->hasEditor() },
-                                { "editorOpen", window != nullptr },
+                                { "editorOpen", window != nullptr && window->isVisible() },
                                 { "params", describeParameters (*plugin) } }).get());
 }
 
@@ -136,6 +193,7 @@ void PluginEffect::openEditor()
 {
     if (window != nullptr)
     {
+        window->setVisible (true);  // LV2 só esconde ao fechar (keepEditorAlive)
         window->toFront (true);
         return;
     }
@@ -150,10 +208,13 @@ void PluginEffect::openEditor()
 
 void PluginEffect::closeEditor()
 {
-    if (window == nullptr)
+    if (window == nullptr || ! window->isVisible())
         return;
 
-    window.reset();
+    if (keepEditorAlive (*plugin))
+        window->setVisible (false);
+    else
+        window.reset();
     emitStateIfChanged();
     sendEvent ("chain.editorClosed", object ({ { "uid", uid } }));
 }

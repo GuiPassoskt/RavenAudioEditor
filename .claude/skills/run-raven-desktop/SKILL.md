@@ -1,6 +1,6 @@
 ---
 name: run-raven-desktop
-description: Abre e controla o app desktop do Raven Audio Editor (Electron + motor JUCE raven-engine) para testar de verdade a reprodução, a mixagem, os efeitos em tempo real, a gravação e os dispositivos de áudio do motor nativo, plugins VST3/LV2 nas cadeias em tempo real (estado, desfazer, janela nativa, compensação de latência), o fluxo Efeito → Plugin (VST3 / LV2)… e a tela Sobre. Use para rodar, testar, tirar prints ou confirmar uma mudança no app desktop, no motor (engine/), no motor de áudio nativo ou no diálogo de plugins.
+description: Abre e controla o app desktop do Raven Audio Editor (Electron + motor JUCE raven-engine) para testar de verdade a reprodução, a mixagem, os efeitos em tempo real, a gravação e os dispositivos de áudio do motor nativo, plugins VST3/LV2 nas cadeias em tempo real (estado, desfazer, janela nativa, compensação de latência), instrumentos virtuais (VSTi) nas faixas MIDI, entrada e gravação MIDI, compensação de latência da gravação, o fluxo Efeito → Plugin (VST3 / LV2)… e a tela Sobre. Use para rodar, testar, tirar prints ou confirmar uma mudança no app desktop, no motor (engine/), no motor de áudio nativo ou no diálogo de plugins.
 ---
 
 # Rodar e testar o Raven Audio Editor desktop
@@ -18,7 +18,15 @@ Arquivos desta skill:
 - `driver/chain-flow.mjs`: plugin numa cadeia em tempo real pela interface (painel →
   Plugin…, parâmetro genérico, histórico, desfazer/refazer, liga/desliga tocando, janela,
   arquivo de projeto), com 8 verificações (Fase 3).
+- `driver/instrument-flow.mjs`: instrumento virtual numa faixa MIDI pela interface (seletor
+  do cabeçalho, tocar, nota avulsa, MIDI → áudio, desfazer, janela, projeto), 8 verificações (Fase 4).
+- `driver/midi-flow.mjs`: entrada MIDI na faixa selecionada, gravação MIDI com R, diálogo
+  com MIDI e latência, ajuste da compensação da gravação de áudio, 8 verificações (Fase 4).
 - `driver/engine-smoke.mjs`: plugins no motor sozinho (ping, lista, processamento).
+- `driver/engine-instrument.mjs`: instrumento na faixa MIDI no motor sozinho (render,
+  reprodução, nota avulsa, release ao parar), 7 verificações.
+- `driver/engine-midi.mjs`: entrada MIDI simulada (`midi.simulate`), faixa alvo e tempo das
+  notas gravadas, 7 verificações.
 - `driver/engine-chain.mjs`: plugin em cadeia no motor sozinho (estado, desfazer sem eco,
   render com o estado ao vivo, PDC, janela, plugin ausente), com 11 verificações.
 - `driver/engine-audio.mjs`: motor de áudio sozinho: ganho/pan exatos, os 8 efeitos,
@@ -34,7 +42,10 @@ Arquivos desta skill:
    3.31 que vem no Build Tools). **Dev-C++/MinGW não serve.**
 4. Plugin **kHs Gain** instalado (Kilohearts Essentials, gratuito). Os cenários
    usam ele porque o resultado é calculável: Gain a 20% do slider dá −18 dB.
-5. Para o teste de compensação de latência: **MFreeformPhase** (MeldaProduction
+5. Instrumento para os testes da Fase 4: **Black Pearl Drumkit** (LV2, AVL Drumkits).
+   Ele carrega amostras em segundo plano: espere ~3 s depois de colocá-lo numa faixa.
+   Não há teclado MIDI nesta máquina: os testes usam `midi.simulate`.
+6. Para o teste de compensação de latência: **MFreeformPhase** (MeldaProduction
    Free Bundle), com 8192 amostras de latência e fase plana por padrão. Sem ele,
    o `engine-chain.mjs` pula esse teste.
 
@@ -60,6 +71,15 @@ Arquivos desta skill:
 - **Entrada padrão** é a do Windows; nesta máquina é o "CABLE Output (VB-Audio
   Virtual Cable)", que grava silêncio. Para testar som de verdade, escolha o
   microfone em Transporte → Dispositivos de áudio… (ou `audio.setDevice` com `input`).
+- **Plugin que imprime no stdout** (FluidSynth) não quebra mais o protocolo, mas
+  scripts próprios que leem o stdout do motor devem ignorar linhas que não são JSON
+  (`try { JSON.parse(line) } catch {}`).
+- **Janela de plugin LV2** (AVL Drumkits) derruba o motor ao ser destruída: o motor só
+  a esconde (`keepEditorAlive`). Não "corrija" isso destruindo a janela.
+- **Itens no fim de listas longas** (o seletor de instrumento tem 18 opções) ficam fora da
+  tela: o `cdplib.mjs` rola o elemento antes de clicar.
+- **Depois de escolher num seletor**, o foco fica nele e o Espaço não chega ao atalho:
+  `document.activeElement?.blur()` antes de teclar.
 - **Comando novo do motor dá "Comando do motor não permitido"**: o processo main
   só aceita uma lista fechada (`ENGINE_COMMANDS` em `src-electron/electron-main.js`).
   Mudar o main reinicia o Electron no `quasar dev`; reabra o app (ver "Encerrar").
@@ -89,6 +109,8 @@ for i in $(seq 1 20); do sleep 1; curl -s http://127.0.0.1:9333/json | grep -q i
 node .claude/skills/run-raven-desktop/driver/plugin-flow.mjs ./raven-prints 9333
 node .claude/skills/run-raven-desktop/driver/transport-flow.mjs ./raven-prints 9333
 node .claude/skills/run-raven-desktop/driver/chain-flow.mjs ./raven-prints 9333
+node .claude/skills/run-raven-desktop/driver/instrument-flow.mjs ./raven-prints 9333
+node .claude/skills/run-raven-desktop/driver/midi-flow.mjs ./raven-prints 9333
 ```
 
 ## Caminho B: modo dev (testa o motor em `engine/bin/`)
@@ -134,6 +156,8 @@ engine/bin/raven-engine.exe --scan > "$D/scan.log"                    # termina 
 node .claude/skills/run-raven-desktop/driver/engine-smoke.mjs "$(cygpath -w engine/bin/raven-engine.exe)" "$(cygpath -w "$D")"
 node .claude/skills/run-raven-desktop/driver/engine-audio.mjs "$(cygpath -w engine/bin/raven-engine.exe)" "$(cygpath -w "$D")" --live
 node .claude/skills/run-raven-desktop/driver/engine-chain.mjs "$(cygpath -w engine/bin/raven-engine.exe)" "$(cygpath -w "$D")"
+node .claude/skills/run-raven-desktop/driver/engine-instrument.mjs "$(cygpath -w engine/bin/raven-engine.exe)" "$(cygpath -w "$D")"
+node .claude/skills/run-raven-desktop/driver/engine-midi.mjs "$(cygpath -w engine/bin/raven-engine.exe)" "$(cygpath -w "$D")"
 ```
 
 O `engine-smoke.mjs` exige RMS a −18 dB com erro < 0,001 (dá 0,0445 exato).

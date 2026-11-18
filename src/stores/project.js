@@ -29,7 +29,14 @@ let clipboard = null
 let rafId = 0
 let rec = null
 let nextFxUid = 1
-let nextStateVersion = 1 // versão do estado de plugins: o motor nativo só recebe o estado quando ela muda
+let nextStateVersion = 1
+const MIDI_RECORD_LIMIT = 600 // a gravação MIDI toca o projeto por até 10 min (até parar)
+
+// Ajuste manual da compensação de latência da gravação (ms), no diálogo de dispositivos.
+export const RECORDING_LATENCY_KEY = 'raven.rec.latencyAdjustMs'
+function recordingLatencyAdjust () {
+  try { return Number(localStorage.getItem(RECORDING_LATENCY_KEY)) || 0 } catch { return 0 }
+} // versão do estado de plugins: o motor nativo só recebe o estado quando ela muda
 
 const zeros = n => new Float32Array(Math.max(0, n))
 export const isMidi = t => t.kind === 'midi'
@@ -54,6 +61,7 @@ function makeTrack (props) {
     solo: props.solo ?? false,
     selected: props.selected ?? false,
     effects: (props.effects ?? []).map(newEffectState),
+    instrument: midi && props.instrument ? newInstrumentState(props.instrument) : null,
     collapsed: false,
     version: version++
   }
@@ -66,6 +74,12 @@ function newEffectState ({ type, params, enabled = true, plugin, state = null })
   const fx = { uid: nextFxUid++, type, enabled, params: { ...realtimeDefaults(type), ...params } }
   if (type === 'plugin') Object.assign(fx, { plugin: { ...plugin }, state, stateVersion: nextStateVersion++ })
   return fx
+}
+
+// Instrumento virtual (VSTi) de uma faixa MIDI (Fase 4): mesmo formato de um slot
+// de plugin. null = sintetizador embutido (programa General MIDI).
+function newInstrumentState ({ plugin, state = null }) {
+  return { uid: nextFxUid++, type: 'plugin', enabled: true, plugin: { ...plugin }, state, stateVersion: nextStateVersion++ }
 }
 
 function setChannels (track, channels) {
@@ -566,6 +580,13 @@ export const useProjectStore = defineStore('project', {
     // O motor avisou que o plugin mudou (janela nativa ou parâmetros). Ajustes
     // seguidos no mesmo plugin viram um passo só do histórico. Devolve a versão nova.
     setPluginStateByUid (uid, state) {
+      for (const t of this.tracks) {
+        if (String(t.instrument?.uid) !== String(uid)) continue
+        const stateVersion = nextStateVersion++
+        t.instrument = { ...t.instrument, state, stateVersion }
+        this.pushState(`Instrumento ajustado: ${t.instrument.plugin.name}`, true)
+        return stateVersion
+      }
       for (const obj of [this.master, ...this.tracks]) {
         const fx = obj.effects?.find(e => String(e.uid) === String(uid))
         if (!fx) continue
@@ -663,8 +684,18 @@ export const useProjectStore = defineStore('project', {
     setInstrument (id, value) {
       const t = this.findTrack(id)
       if (value === 128) { t.drum = true } else { t.drum = false; t.program = value }
+      t.instrument = null
       t.version = version++
       this.pushState('Instrumento alterado')
+      this.syncPlayback()
+    },
+    // plugin: { id, name, vendor, format } de um instrumento da lista do motor nativo.
+    setTrackInstrumentPlugin (id, plugin) {
+      const t = this.findTrack(id)
+      if (!t || !isMidi(t)) return
+      t.instrument = newInstrumentState({ plugin: { id: plugin.id, name: plugin.name, vendor: plugin.vendor, format: plugin.format } })
+      this.pushState(`Instrumento: ${plugin.name}`)
+      this.syncPlayback()
     },
 
     setTempo (bpm) {
@@ -823,7 +854,11 @@ export const useProjectStore = defineStore('project', {
     startTicker () {
       cancelAnimationFrame(rafId)
       const tick = () => {
-        if (this.recording) {
+        if (this.recording && rec?.midi) {
+          this.playhead = engine.position() ?? rec.t0
+          this.levels = { play: engine.meterLevels(), rec: 0 }
+          this.followPlayhead()
+        } else if (this.recording) {
           this.playhead = rec.t0 + rec.length / this.rate
           this.levels = { play: engine.meterLevels(), rec: engine.captureLevel() }
           this.followPlayhead()
@@ -862,22 +897,43 @@ export const useProjectStore = defineStore('project', {
     async record () {
       if (this.recording) return
       const targets = this.selectedTracks.filter(isAudio)
+      const midiTarget = this.selectedTracks.find(isMidi)
+      if (!targets.length && midiTarget && engine.startMidiRecording) return this.recordMidi(midiTarget)
       if (!targets.length) {
         throw new Error(this.selectedTracks.length
-          ? 'Gravação de MIDI não é suportada. Selecione uma faixa de áudio.'
+          ? 'Gravar MIDI precisa do app desktop com uma entrada MIDI (Transporte → Dispositivos de áudio…).'
           : 'Selecione uma faixa de áudio para gravar (Faixas → Nova faixa mono / estéreo).')
       }
       this.stop()
       const t0 = this.sel.t0
-      rec = { ids: targets.map(t => t.id), t0, length: 0, buffers: null, lastFlush: 0 }
+      rec = { ids: targets.map(t => t.id), t0, length: 0, buffers: null, lastFlush: 0, trim: 0 }
       try {
-        await engine.startCapture(this.rate, chunk => this.onCaptureChunk(chunk), Math.max(...targets.map(t => t.channels.length)))
+        const capture = await engine.startCapture(this.rate, chunk => this.onCaptureChunk(chunk), Math.max(...targets.map(t => t.channels.length)))
+        // Compensação de latência: o que foi tocado ouvindo a saída chega atrasado pela
+        // latência de ida e volta; o começo do take é descartado (+ ajuste manual).
+        rec.trim = Math.max(0, Math.round(((capture?.latency ?? 0) + recordingLatencyAdjust() / 1000) * this.rate))
       } catch (e) {
         rec = null
         throw new Error(`Não foi possível acessar o microfone: ${e.message}`)
       }
       // Overdub: toca o projeto a partir do cursor enquanto grava.
       if (this.duration > t0) await engine.play(this.tracks, this.rate, t0, this.duration, this.master)
+      this.recTake = { ids: rec.ids, t0, length: 0 }
+      this.recording = true
+      this.startTicker()
+    },
+
+    // Grava notas na faixa MIDI tocando o projeto a partir do cursor (motor nativo).
+    async recordMidi (track) {
+      this.stop()
+      const t0 = this.sel.t0
+      rec = { midi: true, ids: [track.id], t0, events: [], timer: null }
+      await engine.startMidiRecording()
+      await engine.play(this.tracks, this.rate, t0, t0 + MIDI_RECORD_LIMIT, this.master)
+      rec.timer = setInterval(() => {
+        const r = rec
+        if (r?.midi) engine.readMidiRecording().then(events => r.events.push(...events)).catch(() => {})
+      }, 200)
       this.recTake = { ids: rec.ids, t0, length: 0 }
       this.recording = true
       this.startTicker()
@@ -943,9 +999,12 @@ export const useProjectStore = defineStore('project', {
     async stopRecording () {
       if (!rec || rec.stopping) return
       rec.stopping = true
+      if (rec.midi) return this.finishMidiRecording()
       await engine.stopCapture()
       engine.stop()
-      const { t0, length, ids, buffers } = rec
+      const { t0, ids, buffers, trim } = rec
+      // Sem o trecho da latência no começo: o take fica alinhado com o que se ouvia.
+      const length = rec.length > trim ? rec.length - trim : 0
       rec = null
       this.recording = false
       this.recTake = null
@@ -956,11 +1015,31 @@ export const useProjectStore = defineStore('project', {
         const track = this.findTrack(id)
         if (!track) continue
         // Mono: entrada 1. Estéreo: entradas 1 e 2.
-        const data = buffers.slice(0, track.channels.length).map(b => b.slice(0, length))
+        const data = buffers.slice(0, track.channels.length).map(b => b.slice(trim, trim + length))
         this.overwriteAt(track, t0, data)
       }
       this.setSelection(t0, t0 + length / this.rate)
       this.pushState(ids.length > 1 ? `Gravado áudio em ${ids.length} faixas` : 'Gravado áudio')
+    },
+
+    async finishMidiRecording () {
+      const r = rec
+      clearInterval(r.timer)
+      const end = engine.position() ?? r.t0
+      const events = [...r.events, ...await engine.stopMidiRecording()]
+      engine.stop()
+      rec = null
+      this.recording = false
+      this.recTake = null
+      this.playhead = null
+      cancelAnimationFrame(rafId)
+      const track = this.findTrack(r.ids[0])
+      const notes = track ? N.notesFromMidiEvents(events, track.offset, end) : []
+      if (!notes.length) return
+      setNotes(track, [...track.notes, ...notes])
+      this.setSelection(r.t0, end)
+      this.pushState(`Gravado MIDI: ${notes.length} nota${notes.length > 1 ? 's' : ''}`)
+      this.syncPlayback()
     }
   }
 })

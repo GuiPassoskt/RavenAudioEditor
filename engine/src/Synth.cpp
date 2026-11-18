@@ -154,6 +154,30 @@ void Synth::noteOn (int pitch, int velocity, int program, bool drum, int offset,
     v.stopAt = v.releaseAt + (juce::int64) (fam.r * 1.5 * sampleRate);
 }
 
+void Synth::release (Voice& v, juce::int64 at)
+{
+    if (! v.active || v.drum || v.releaseAt <= at)
+        return;
+
+    const auto& fam = familyOf (v.family);
+    v.releaseAt = juce::jmax<juce::int64> (1, at);
+    v.releaseFrom = (float) attackDecay (fam, v.pitch, v.level, (double) v.releaseAt / sampleRate);
+    v.stopAt = v.releaseAt + (juce::int64) (fam.r * 1.5 * sampleRate);
+}
+
+void Synth::noteOff (int pitch, int offset)
+{
+    for (auto& v : voices)
+        if (v.pitch == pitch)
+            release (v, v.age + offset);
+}
+
+void Synth::releaseAll()
+{
+    for (auto& v : voices)
+        release (v, v.age);
+}
+
 float Synth::noise (Voice& v)
 {
     v.noiseSeed ^= v.noiseSeed << 13;

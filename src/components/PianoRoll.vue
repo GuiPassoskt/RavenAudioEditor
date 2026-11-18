@@ -8,9 +8,13 @@
         options-dense class="pr-track" @update:model-value="v => (ui.pianoRoll = v)"
       />
       <q-select
-        v-if="track" :model-value="track.drum ? 128 : Math.floor(track.program / 8) * 8" :options="INSTRUMENTS"
+        v-if="track" :model-value="instrumentValue(track)" :options="instrumentOptions(track)"
         emit-value map-options dense dark borderless options-dense class="pr-instr"
-        @update:model-value="v => store.setInstrument(track.id, v)"
+        @update:model-value="v => chooseInstrument(track, v)"
+      />
+      <q-btn
+        v-if="track?.instrument" flat dense round size="sm" icon="open_in_new" color="grey-4"
+        title="Abrir a janela do instrumento" @click="openInstrument(track)"
       />
       <q-separator vertical dark inset />
       <q-input
@@ -70,7 +74,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { useProjectStore } from 'src/stores/project'
 import { useUiStore } from 'src/stores/ui'
 import { keyName, useCommands } from 'src/composables/commands'
-import { INSTRUMENTS } from 'src/audio/synth'
+import { useInstrumentChoice } from 'src/composables/instruments'
 import { engine } from 'src/audio/engine'
 import { isBlackKey, noteId, pitchName } from 'src/audio/midifile'
 import { quantize } from 'src/audio/notes'
@@ -85,6 +89,7 @@ const SNAPS = [
 ]
 
 const store = useProjectStore()
+const { instrumentValue, instrumentOptions, chooseInstrument, openInstrument } = useInstrumentChoice()
 const ui = useUiStore()
 const { exec, keymap } = useCommands()
 
@@ -277,7 +282,7 @@ function hitTest (x, y) {
 
 function audition (pitch, vel = newVel.value) {
   const t = track.value
-  engine.auditionNote(store.rate, pitch, t.program, t.drum, vel)
+  engine.auditionNote(store.rate, pitch, t.program, t.drum, vel, t.id)
 }
 
 function localPos (e, el) {

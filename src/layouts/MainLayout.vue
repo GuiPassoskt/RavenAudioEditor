@@ -27,6 +27,11 @@
     <EffectDialog />
     <PluginEffectDialog v-if="hasNativeEngine" />
     <AudioDevicesDialog v-if="hasNativeEngine" />
+    <PluginPickerDialog
+      v-if="hasNativeEngine" instruments :model-value="ui.instrumentPicker !== null"
+      @update:model-value="v => { if (!v) ui.instrumentPicker = null }"
+      @pick="plugin => plugin && store.setTrackInstrumentPlugin(ui.instrumentPicker, plugin)"
+    />
     <AnalysisDialogs />
     <InfoDialogs />
     <SplashDialog />
@@ -34,7 +39,7 @@
 </template>
 
 <script setup>
-import { onBeforeUnmount } from 'vue'
+import { computed, onBeforeUnmount, watch } from 'vue'
 import { Notify } from 'quasar'
 import { useUiStore } from 'src/stores/ui'
 import { useProjectStore } from 'src/stores/project'
@@ -48,6 +53,7 @@ import HistoryPanel from 'components/HistoryPanel.vue'
 import EffectDialog from 'components/EffectDialog.vue'
 import PluginEffectDialog from 'components/PluginEffectDialog.vue'
 import AudioDevicesDialog from 'components/AudioDevicesDialog.vue'
+import PluginPickerDialog from 'components/PluginPickerDialog.vue'
 import AnalysisDialogs from 'components/AnalysisDialogs.vue'
 import InfoDialogs from 'components/InfoDialogs.vue'
 import RealtimeEffectsPanel from 'components/RealtimeEffectsPanel.vue'
@@ -68,6 +74,10 @@ const offEngineEvents = nativePlugins.onEvent((name, msg) => {
   }
 })
 onBeforeUnmount(offEngineEvents)
+
+// A entrada MIDI toca na faixa MIDI selecionada: o motor precisa saber qual é.
+const selectedMidiTrack = computed(() => store.tracks.find(t => t.kind === 'midi' && t.selected)?.id ?? null)
+watch(selectedMidiTrack, () => store.syncEngine())
 </script>
 
 <style scoped>

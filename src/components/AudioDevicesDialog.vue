@@ -40,6 +40,27 @@
           Buffers menores dão menos latência, mas pedem mais do processador.
           <template v-if="!sameDevice">Taxa e buffer ficam disponíveis depois de aplicar o novo dispositivo.</template>
         </div>
+
+        <q-separator dark />
+        <div class="text-subtitle2">MIDI</div>
+        <q-select
+          v-model="midiInput" :options="midiOptions" label="Entrada MIDI (teclado ou controlador)"
+          emit-value map-options dense dark outlined @update:model-value="applyMidiInput"
+        />
+        <div class="text-caption text-grey-6">
+          As notas tocam na faixa MIDI selecionada. Com ela selecionada, Gravar (R) grava as notas.
+        </div>
+
+        <q-separator dark />
+        <div class="text-subtitle2">Gravação</div>
+        <q-input
+          v-model.number="latencyAdjust" type="number" step="1" suffix="ms" dense dark outlined
+          label="Ajuste da compensação de latência" @update:model-value="saveLatencyAdjust"
+        />
+        <div class="text-caption text-grey-6">
+          O começo de cada take é deslocado pela latência de ida e volta informada pelo driver, mais este
+          ajuste. Se o que você grava ainda sai atrasado em relação ao que ouvia, aumente o valor.
+        </div>
       </q-card-section>
 
       <q-card-actions align="right">
@@ -58,7 +79,8 @@ import { computed, ref, watch } from 'vue'
 import { Notify } from 'quasar'
 import { useProjectStore } from 'src/stores/project'
 import { useUiStore } from 'src/stores/ui'
-import { audioDevices, setAudioDevice } from 'src/audio/engine-native'
+import { audioDevices, midiDevices, setAudioDevice, setMidiInput } from 'src/audio/engine-native'
+import { RECORDING_LATENCY_KEY } from 'src/stores/project'
 import { notifyError } from 'src/composables/commands'
 
 const store = useProjectStore()
@@ -69,6 +91,14 @@ const current = ref(null)
 const form = ref(null)
 const loading = ref(false)
 const applying = ref(false)
+const midiInputs = ref([])
+const midiInput = ref('')
+const latencyAdjust = ref(0)
+
+const midiOptions = computed(() => [
+  { label: 'Nenhuma', value: '' },
+  ...midiInputs.value.map(d => ({ label: d.name, value: d.id }))
+])
 
 const selectedType = computed(() => types.value.find(t => t.name === form.value?.type))
 const inputOptions = computed(() => [
@@ -89,14 +119,30 @@ function load (result) {
 watch(() => ui.audioDevicesOpen, async open => {
   if (!open) return
   loading.value = true
+  try { latencyAdjust.value = Number(localStorage.getItem(RECORDING_LATENCY_KEY)) || 0 } catch { /* sem storage */ }
   try {
     load(await audioDevices())
+    const midi = await midiDevices()
+    midiInputs.value = midi.inputs
+    midiInput.value = midi.current
   } catch (e) {
     notifyError(e)
   } finally {
     loading.value = false
   }
 })
+
+async function applyMidiInput (id) {
+  try {
+    await setMidiInput(id)
+  } catch (e) {
+    notifyError(e)
+  }
+}
+
+function saveLatencyAdjust (value) {
+  try { localStorage.setItem(RECORDING_LATENCY_KEY, String(Number(value) || 0)) } catch { /* sem storage */ }
+}
 
 function onTypeChange () {
   const t = selectedType.value

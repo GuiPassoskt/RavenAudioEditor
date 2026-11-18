@@ -12,20 +12,46 @@
 #if JUCE_WINDOWS
  #include <fcntl.h>
  #include <io.h>
+ #include <windows.h>
+#else
+ #include <unistd.h>
 #endif
 
 namespace raven
 {
 
 static std::mutex outputMutex;
+static FILE* protocolOut = stdout;
 
+// O canal do protocolo é uma cópia privada do stdout; o stdout do processo passa
+// a apontar para o stderr. Plugins que imprimem no stdout (o FluidSynth dos AVL
+// Drumkits, por exemplo) não corrompem mais as mensagens JSON.
 void initStdio()
 {
+    std::fflush (stdout);
+
    #if JUCE_WINDOWS
-    // Sem isso o Windows troca "\n" por "\r\n" e reinterpreta bytes UTF-8.
+    // Sem _O_BINARY o Windows troca "\n" por "\r\n" e reinterpreta bytes UTF-8.
     _setmode (_fileno (stdin), _O_BINARY);
-    _setmode (_fileno (stdout), _O_BINARY);
+    const int privateFd = _dup (_fileno (stdout));
+    if (privateFd >= 0)
+    {
+        _setmode (privateFd, _O_BINARY);
+        protocolOut = _fdopen (privateFd, "wb");
+        _dup2 (_fileno (stderr), _fileno (stdout));
+        SetStdHandle (STD_OUTPUT_HANDLE, GetStdHandle (STD_ERROR_HANDLE));  // quem escreve direto no handle
+    }
+   #else
+    const int privateFd = dup (STDOUT_FILENO);
+    if (privateFd >= 0)
+    {
+        protocolOut = fdopen (privateFd, "wb");
+        dup2 (STDERR_FILENO, STDOUT_FILENO);
+    }
    #endif
+
+    if (protocolOut == nullptr)
+        protocolOut = stdout;
 }
 
 void send (const juce::var& message)
@@ -35,9 +61,9 @@ void send (const juce::var& message)
 
     // Eventos podem sair de outras threads (varredura, callbacks): uma linha por vez.
     const std::lock_guard lock (outputMutex);
-    std::fwrite (line.data(), 1, line.size(), stdout);
-    std::fputc ('\n', stdout);
-    std::fflush (stdout);
+    std::fwrite (line.data(), 1, line.size(), protocolOut);
+    std::fputc ('\n', protocolOut);
+    std::fflush (protocolOut);
 }
 
 juce::DynamicObject::Ptr object (std::initializer_list<std::pair<juce::Identifier, juce::var>> properties)

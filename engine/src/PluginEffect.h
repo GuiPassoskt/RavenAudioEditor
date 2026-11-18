@@ -24,7 +24,9 @@ public:
     using Ptr = juce::ReferenceCountedObjectPtr<PluginEffect>;
 
     // offline: instância de render offline (sem janela, sem eventos para a interface).
-    PluginEffect (juce::String uid, juce::String pluginId, std::unique_ptr<juce::AudioPluginInstance> plugin, bool offline);
+    // instrument: VSTi de uma faixa MIDI (Fase 4): só saídas, toca com renderInstrument().
+    PluginEffect (juce::String uid, juce::String pluginId, std::unique_ptr<juce::AudioPluginInstance> plugin,
+                  bool offline, bool instrument = false);
     ~PluginEffect() override;
 
     const juce::String uid, pluginId;
@@ -39,6 +41,13 @@ public:
     void closeEditor();
 
     int getLatencySamples() const override { return plugin->getLatencySamples(); }
+
+    // Thread de áudio: instrumento gera o som da faixa a partir dos eventos MIDI do bloco.
+    void renderInstrument (juce::AudioBuffer<float>& out, int numSamples, juce::MidiBuffer& events);
+
+    // Render offline: instrumentos carregam amostras em segundo plano (o FluidSynth
+    // dos AVL Drumkits, por exemplo); espera um pouco processando silêncio.
+    void waitUntilReady() override;
 
     juce::int64 appliedVersion = 0;         // versão do estado vinda da interface já aplicada
     std::function<void()> onLatencyChanged;  // o motor remonta o grafo (compensação de latência)
@@ -59,11 +68,17 @@ private:
     std::unique_ptr<juce::AudioPluginInstance> plugin;
     std::unique_ptr<PluginWindow> window;
     const bool offline;
+
+public:
+    const bool instrument;
+
+private:
     bool stereo = true;
     juce::AudioBuffer<float> io;
     juce::MidiBuffer midi;
     juce::String initialState, lastState;
     int lastLatency = 0;
+    int blockSize = 512;
 
     juce::SpinLock pendingLock;
     std::map<int, float> pendingParams;

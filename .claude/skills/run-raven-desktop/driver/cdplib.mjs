@@ -26,13 +26,16 @@ export async function connect (port = 9333) {
   }
   const sleep = ms => new Promise(r => setTimeout(r, ms))
 
-  // Centro do elemento visível cujo texto contém `text` (dentro de `scope`, opcional).
+  // Centro do elemento visível cujo texto contém `text` (dentro de `selector`),
+  // rolado para dentro da tela.
   const findByText = (text, selector = '*') => evaluate(`(() => {
     const els = [...document.querySelectorAll(${JSON.stringify(selector)})].filter(e => {
       const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && e.textContent.includes(${JSON.stringify(text)})
     })
     els.sort((a, b) => a.textContent.length - b.textContent.length)
     const e = els[0]; if (!e) return null
+    // Itens no fim de listas longas (menus que rolam) ficam fora da tela.
+    e.scrollIntoView({ block: 'nearest' })
     const r = e.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width }
   })()`)
   const clickAt = async (x, y) => {
@@ -65,7 +68,7 @@ export async function connect (port = 9333) {
     while (Date.now() - t0 < timeout) {
       const v = await evaluate(expr).catch(() => null)
       if (v) return v
-      await sleep(250)
+      await sleep(50) // curto: alguns cenários medem tempo a partir da mudança de estado
     }
     throw new Error(`timeout esperando: ${expr}`)
   }

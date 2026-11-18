@@ -21,6 +21,7 @@ namespace raven
 {
 
 class AudioEngine final : private juce::AudioIODeviceCallback,
+                          private juce::MidiInputCallback,
                           private juce::Timer
 {
 public:
@@ -58,6 +59,15 @@ private:
     juce::var setPluginParam (const juce::var& message);
     juce::var openPluginEditor (const juce::var& message);
     juce::var closePluginEditor (const juce::var& message);
+    juce::var midiDevices();
+    juce::var setMidiInput (const juce::var& message);
+    juce::var startMidiRecording();
+    juce::var readMidiRecording();
+    juce::var stopMidiRecording();
+    juce::var simulateMidi (const juce::var& message);
+
+    // Entrada MIDI (thread do driver MIDI): só enfileira no coletor.
+    void handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage& message) override;
 
     PluginEffect& livePlugin (const juce::var& message);
     void rebuildGraph();
@@ -112,6 +122,7 @@ private:
     juce::uint32 audioPlaySequence = 0;
     std::atomic<juce::int64> playStart { 0 }, playEnd { 0 }, position { 0 };
     bool wasActive = false;
+    bool audioWasPlaying = false;  // thread de áudio: detecta o stop para soltar as notas
 
     // Prévia de efeito e notas avulsas do piano roll.
     Clip::Ptr previewClip;
@@ -125,6 +136,25 @@ private:
     std::array<AuditionNote, 64> auditionNotes {};
     Synth auditionSynth;
     double auditionRate = 0;
+
+    // Entrada MIDI (Fase 4): o driver MIDI (e midi.simulate) enfileiram cada
+    // mensagem com o horário de chegada; o thread de áudio a posiciona no bloco pelo
+    // atraso. (O MidiMessageCollector do JUCE descartava mensagens que chegavam
+    // entre a leitura do relógio e a entrada na fila.) Durante a gravação, os
+    // eventos vão para outro FIFO, lido pela interface.
+    struct IncomingMidi { juce::uint8 status, data1, data2; double time; };
+    void queueMidi (const juce::MidiMessage& message);
+    std::unique_ptr<juce::MidiInput> midiInput;
+    juce::String midiInputId;
+    juce::SpinLock midiQueueLock;  // só entre produtores (driver MIDI e thread de mensagens)
+    juce::AbstractFifo midiQueueFifo { 1024 };
+    std::array<IncomingMidi, 1024> midiQueue {};
+    juce::MidiBuffer midiBlock;
+    std::atomic<bool> midiRecording { false };
+    std::atomic<bool> midiActivity { false };
+    struct RecordedMidi { juce::int64 sample; juce::uint8 status, data1, data2; };
+    juce::AbstractFifo midiRecordFifo { 8192 };
+    std::vector<RecordedMidi> midiRecordQueue = std::vector<RecordedMidi> (8192);
 
     // Medidores (pico desde a última leitura).
     std::atomic<float> masterPeakL { 0 }, masterPeakR { 0 }, inputPeak { 0 };

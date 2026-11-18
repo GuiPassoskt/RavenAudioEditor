@@ -107,8 +107,11 @@ export class NativeAudioEngine {
   // (notesKey = versão da faixa), exceto no render offline (allNotes).
   #projectJson (tracks, master, rate, allNotes = false) {
     const fxJson = fx => this.#fxJson(fx, allNotes)
+    // A entrada MIDI toca na faixa MIDI selecionada.
+    const midiTarget = tracks.find(t => t.kind === 'midi' && t.selected)
     return {
       rate,
+      midiTarget: midiTarget ? String(midiTarget.id) : null,
       master: { gain: master.gain, effects: master.effects.map(fxJson) },
       tracks: tracks.map(t => {
         const json = {
@@ -117,7 +120,10 @@ export class NativeAudioEngine {
         }
         if (isAudio(t)) return { ...json, clip: t.channels[0]?.length ? this.#clipId(t.channels) : null }
 
-        Object.assign(json, { program: t.program, drum: t.drum, notesKey: String(t.version) })
+        Object.assign(json, {
+          program: t.program, drum: t.drum, notesKey: String(t.version),
+          instrument: t.instrument ? this.#fxJson(t.instrument, allNotes) : null
+        })
         if (allNotes || this.#notesSent.get(json.id) !== json.notesKey) {
           json.notes = t.notes.map(n => ({ start: n.start, dur: n.dur, pitch: n.pitch, vel: n.vel }))
           if (!allNotes) this.#notesSent.set(json.id, json.notesKey)
@@ -198,8 +204,9 @@ export class NativeAudioEngine {
     this.previewing = false
   }
 
-  auditionNote (rate, pitch, program, drum, vel = 100) {
-    return request('synth.audition', { pitch, program, drum, vel })
+  // Com trackId, a nota toca pela própria faixa (instrumento VSTi e efeitos).
+  auditionNote (rate, pitch, program, drum, vel = 100, trackId = null) {
+    return request('synth.audition', { pitch, program, drum, vel, ...(trackId != null ? { trackId: String(trackId) } : {}) })
   }
 
   // ---- Medidores ----
@@ -232,10 +239,30 @@ export class NativeAudioEngine {
   }
 
   // ---- Captura (gravação) ----
+  // Devolve { latency }: latência de ida e volta do driver, em segundos (o store
+  // descarta esse trecho do começo do take).
   async startCapture (rate, onChunk, channels = 2) {
     await request('project.setRate', { rate })
-    await request('capture.start', { channels })
+    const info = await request('capture.start', { channels })
     this.#capture = { onChunk, reading: null, timer: setInterval(() => this.#readCapture(), CAPTURE_POLL_MS) }
+    return info
+  }
+
+  // ---- Entrada e gravação MIDI ----
+  startMidiRecording () {
+    return request('midi.startRecording')
+  }
+
+  readMidiRecording () {
+    return request('midi.read')
+  }
+
+  stopMidiRecording () {
+    return request('midi.stopRecording')
+  }
+
+  midiActivity () {
+    return !!(this.#fresh() && this.#meters.midiIn)
   }
 
   #readCapture () {
@@ -277,6 +304,7 @@ export async function createNativeEngine () {
     console.warn('[motor nativo] dispositivo de áudio indisponível:', info.audio.error)
     return null
   }
+  restoreMidiInput().catch(e => console.warn('[motor nativo] entrada MIDI:', e.message))
   return new NativeAudioEngine()
 }
 
@@ -284,6 +312,21 @@ export async function createNativeEngine () {
 // entradas, taxas e tamanhos de buffer, e a troca do dispositivo (salva entre sessões).
 export const audioDevices = () => request('audio.devices')
 export const setAudioDevice = settings => request('audio.setDevice', settings)
+
+// Entrada MIDI (teclado/controlador), lembrada entre sessões.
+const MIDI_INPUT_KEY = 'raven.midi.input'
+export const midiDevices = () => request('midi.devices')
+export async function setMidiInput (id) {
+  await request('midi.setInput', { id: id ?? '' })
+  try { localStorage.setItem(MIDI_INPUT_KEY, id ?? '') } catch { /* sem storage */ }
+}
+async function restoreMidiInput () {
+  let id = ''
+  try { id = localStorage.getItem(MIDI_INPUT_KEY) ?? '' } catch { /* sem storage */ }
+  if (!id) return
+  const { inputs } = await midiDevices()
+  if (inputs.some(d => d.id === id)) await request('midi.setInput', { id })
+}
 
 // Plugins nas cadeias em tempo real (Fase 3): informações, parâmetros e janela
 // nativa de um slot, pelo uid do efeito.
