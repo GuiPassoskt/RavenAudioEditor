@@ -11,3 +11,5 @@ yarn-debug.log*
 *.ntvs*
 *.njsproj
 *.sln
+/engine/build
+/engine/bin

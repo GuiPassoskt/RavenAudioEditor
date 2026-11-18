@@ -4,9 +4,14 @@ Este documento registra a análise sobre integrar plugins de terceiros e o plano
 para transformar o Raven Audio Editor, hoje uma SPA Quasar, num aplicativo
 **Electron + C++** com acesso nativo à máquina e, mais adiante, numa DAW.
 
-- Situação atual: SPA no navegador, com motor de áudio em Web Audio API.
+- Situação atual: app Quasar que roda no navegador e em modo Electron
+  (`npm run dev:electron`), com motor de áudio em Web Audio API.
 - Objetivo: app desktop (Electron) com motor de áudio nativo em C++, hospedagem
   de plugins de terceiros, baixa latência e acesso direto a dispositivos de áudio e MIDI.
+- **Decisão tomada: o motor nativo será feito com JUCE**, rodando como um
+  executável separado controlado pelo Electron. Ver a [seção 4](#4-decisão-motor-com-juce).
+- **Licença: o Raven é código aberto sob AGPLv3**, usando o JUCE também sob
+  AGPLv3. Ver a [seção 7](#7-licenças).
 
 > Os diagramas usam **Mermaid**. Eles aparecem desenhados no GitHub e no GitLab,
 > e no VS Code com a extensão *Markdown Preview Mermaid Support*.
@@ -29,8 +34,8 @@ flowchart LR
     UI2["Quasar / Vue<br/>mesmas telas"]
     ST2["Pinia<br/>fonte da verdade do projeto"]
     BR["Ponte IPC<br/>preload + main"]
-    EN["Motor de áudio C++<br/>grafo, transporte, gravação"]
-    PL["Plugins de terceiros<br/>VST3, LV2, CLAP, AU"]
+    EN["Motor de áudio C++ com JUCE<br/>processo separado"]
+    PL["Plugins de terceiros<br/>VST3, LV2, AU"]
     HW(["Interface de áudio e MIDI<br/>ASIO, WASAPI, CoreAudio, ALSA"])
     UI2 --> ST2 --> BR --> EN
     EN <--> PL
@@ -48,7 +53,7 @@ VST2, VST3, LV2, LADSPA e CLAP são **bibliotecas nativas compiladas**:
 
 | Formato | Arquivo | Observação |
 |---|---|---|
-| VST2 | `.dll` (Win), `.vst` (macOS), `.so` (Linux) | SDK descontinuado, ver seção 6 |
+| VST2 | `.dll` (Win), `.vst` (macOS), `.so` (Linux) | SDK descontinuado, ver seção 7 |
 | VST3 | pacote `.vst3` | SDK gratuito da Steinberg |
 | LV2 | pasta `.lv2` (`.so`/`.dll` + metadados `.ttl`) | Padrão aberto |
 | LADSPA | `.so`/`.dll` | Antecessor do LV2, sem interface gráfica própria. **Não existe "LV1"**: o formato anterior ao LV2 é o LADSPA |
@@ -79,7 +84,12 @@ carregamento, mapeamento de parâmetros, presets, tela genérica).
 
 ## 2. Opções de arquitetura
 
-### Opção A: Electron + motor de áudio nativo em C++ (recomendada para a DAW)
+> **Atualização:** com a escolha do JUCE, o caminho adotado é a **Opção B**
+> (motor em processo separado). A Opção A continua descrita aqui porque o fluxo
+> de sinal, as threads e o contrato de comandos valem igualmente para a Opção B.
+> O motivo da troca está na [seção 4.2](#42-por-que-processo-separado-e-não-addon-n-api).
+
+### Opção A: Electron + motor de áudio nativo em C++ como addon N-API
 
 #### Diagrama de componentes
 
@@ -206,7 +216,7 @@ flowchart LR
   - Alternativa mais "mão na massa": **RtAudio/PortAudio** + **VST3 SDK** + **lilv**
     (LV2) + **CLAP SDK**, com grafo próprio.
 
-### Opção B: processo nativo separado, controlado pela interface
+### Opção B: processo nativo separado, controlado pela interface (adotada, com JUCE)
 
 - Um executável à parte (por exemplo Carla em modo sem interface, ou um app
   JUCE próprio) faz o áudio e os plugins. O Quasar conversa com ele por
@@ -243,11 +253,14 @@ flowchart LR
 
 ### Opção C: só aplicar o efeito, sem tempo real (fase intermediária)
 
-- No Electron, um addon nativo recebe um trecho de áudio (`Float32Array`),
+- No Electron, o motor nativo recebe um trecho de áudio (`Float32Array`),
   passa pelo plugin e devolve o resultado, como o "Efeito → Aplicar" do Audacity.
 - Mantém o motor Web Audio atual. Não há prévia ao vivo nem plugin na mesa de
   som durante a reprodução.
 - É o menor passo para validar a hospedagem de plugins sem reescrever o motor.
+- O preload **não** fala direto com código nativo: no Electron 20+ ele roda em
+  sandbox e não carrega módulos `.node`. O caminho é sempre
+  preload → `ipcRenderer.invoke` → processo main → motor.
 
 ```mermaid
 sequenceDiagram
@@ -255,20 +268,23 @@ sequenceDiagram
   participant V as Quasar<br/>EffectDialog
   participant S as Pinia<br/>applyEffect
   participant P as Preload<br/>window.audio
-  participant A as Addon C++
+  participant M as Electron main<br/>engine-host.js
+  participant A as Motor JUCE<br/>raven-engine.exe
   participant G as Plugin VST3/LV2
 
   U->>V: Efeito → Plugin… → Aplicar
   V->>S: applyEffect com pluginId e parâmetros
   S->>P: plugins.process com canais do trecho e taxa
-  P->>A: chamada N-API em thread de trabalho
+  P->>M: ipcRenderer.invoke
+  M->>A: comando + áudio pelo pipe binário
   A->>G: carrega, configura taxa e bloco, define parâmetros
   loop blocos de 512 amostras
-    A->>G: process de entrada para saída
+    A->>G: processBlock
   end
   G-->>A: áudio processado
-  A-->>P: Float32Array por canal
-  P-->>S: resultado
+  A-->>M: Float32 por canal
+  M-->>P: resultado
+  P-->>S: Float32Array por canal
   S->>S: replaceRange + pushState para o undo
   S-->>V: waveform redesenhado
 ```
@@ -284,13 +300,14 @@ sequenceDiagram
 
 ## 3. Recomendação e roteiro
 
-Para o objetivo declarado (app desktop, acesso nativo e uma DAW no futuro), a
-recomendação é a **Opção A**, chegando nela em fases.
+Para o objetivo declarado (app desktop, acesso nativo e uma DAW no futuro), o
+caminho é um **motor nativo com JUCE em processo separado** (Opção B), chegando
+nele em fases. A Fase 1 usa esse mesmo processo só para aplicar efeitos (Opção C).
 
 | Fase | Entrega | Motor de áudio | Risco |
 |---|---|---|---|
-| 0 | Projeto em modo Electron (`quasar mode add electron`), build e instalador | Web Audio (atual) | Baixo |
-| 1 | Addon C++ (N-API) que **lista plugins** VST3/LV2/CLAP instalados e **aplica efeito em trecho** (Opção C) | Web Audio + addon só para aplicar efeito | Baixo/médio |
+| 0 ✅ | Projeto em modo Electron (`@quasar/app-vite` v3), `npm run dev:electron` e `npm run build:electron` funcionando | Web Audio (atual) | Concluída |
+| 1 ✅ | Executável JUCE (`raven-engine`) iniciado pelo Electron, que **lista plugins** VST3/LV2 instalados e **aplica efeito em trecho** (Opção C). Testada pela interface no modo dev e no app empacotado (seção 8) | Web Audio + motor JUCE só para aplicar efeito | Concluída |
 | 2 | **Motor nativo** de reprodução e mixagem (I/O nativo, grafo, transporte). O Web Audio sai | Nativo | Alto |
 | 3 | Plugins **em tempo real** nas cadeias de faixa e master, mais as janelas nativas dos plugins | Nativo | Médio |
 | 4 | Instrumentos virtuais (VSTi) nas faixas MIDI, MIDI I/O de hardware, gravação com compensação de latência | Nativo | Médio |
@@ -298,8 +315,8 @@ recomendação é a **Opção A**, chegando nela em fases.
 
 ```mermaid
 flowchart LR
-  F0["Fase 0<br/>Electron<br/>build e instalador"]
-  F1["Fase 1<br/>Addon C++<br/>varredura + aplicar efeito"]
+  F0["Fase 0 ✅<br/>Electron<br/>build e instalador"]
+  F1["Fase 1 ✅<br/>Motor JUCE<br/>varredura + aplicar efeito"]
   F2["Fase 2<br/>Motor nativo<br/>I/O, grafo, transporte"]
   F3["Fase 3<br/>Plugins em tempo real<br/>janelas nativas"]
   F4["Fase 4<br/>VSTi, MIDI de hardware,<br/>latência de gravação"]
@@ -322,7 +339,7 @@ Azul: fases que ainda usam o motor Web Audio. Verde: fases com motor nativo.
 
 | Hoje (SPA) | Depois (Electron + C++) |
 |---|---|
-| `src/audio/engine.js` (grafo Web Audio, `render` offline, agendador MIDI, gravação) | Vira um **cliente** do motor nativo: mesma API (`play`, `stop`, `updateMix`, `render`, `startCapture`), mas implementada com chamadas IPC |
+| `src/audio/engine.js` (grafo Web Audio, `render` offline, agendador MIDI, gravação) | Vira um **cliente** do motor nativo: mesma API (`play`, `stop`, `updateMix`, `render`, `startCapture`), mas implementada com chamadas IPC. No navegador continua usando Web Audio (detecta `window.audio`) |
 | `src/audio/realtime.js` (efeitos como nós Web Audio) | Efeitos internos migram para C++. O catálogo passa a vir do motor (internos + plugins encontrados na varredura) |
 | `src/audio/synth.js` | Sai de cena ou vira o instrumento padrão no motor nativo. Faixas MIDI passam a aceitar VSTi |
 | `src/audio/effects.js`, `dsp.js` | Podem ficar em JS no começo (efeitos destrutivos). Depois migram para C++ por desempenho |
@@ -334,6 +351,10 @@ A separação que já existe ajuda nessa migração: as telas (`components/`)
 não falam com o Web Audio diretamente, só com o store e com `engine`.
 
 ### 3.2 Contrato de IPC sugerido (rascunho)
+
+> Este rascunho é o alvo das **Fases 2 e 3** (motor em tempo real). Os comandos
+> que já existem, da Fase 1, têm outros nomes (`plugins.list`, `fx.create`,
+> `fx.setParam`, `fx.process` etc.) e estão na [seção 4.5](#45-ligação-com-o-electron-como-está-implementado).
 
 Mensagens da interface para o motor (comandos):
 
@@ -405,23 +426,217 @@ Regras importantes:
 
 ---
 
-## 4. Telas (GUI) dos plugins
+## 4. Decisão: motor com JUCE
+
+O motor nativo será escrito com o **JUCE** (https://juce.com). PortAudio e
+RtAudio foram descartados: eles só abrem o dispositivo de áudio, e todo o resto
+(hospedar plugins, MIDI, ler arquivos, grafo de processamento) teria que ser
+escrito à mão ou juntado de várias bibliotecas.
+
+### 4.1 O que o JUCE resolve e o que não resolve
+
+| Necessidade | Módulo / classe do JUCE | Observação |
+|---|---|---|
+| Driver de áudio (ASIO, WASAPI, CoreAudio, ALSA, JACK) | `juce_audio_devices`: `AudioDeviceManager` | O JUCE 9 já traz o ASIO SDK 2.3; basta `-DRAVEN_ASIO=ON` (Fase 2) |
+| Portas MIDI de hardware | `juce_audio_devices`: `MidiInput`, `MidiOutput` | |
+| Varredura e carga de plugins | `juce_audio_processors`: `AudioPluginFormatManager`, `KnownPluginList`, `PluginDirectoryScanner` | VST3, AU (macOS), LV2 e LADSPA (Linux). VST2 só com o SDK antigo, ver seção 7 |
+| Varredura isolada (plugin que trava não derruba o motor) | `PluginDirectoryScanner` com um processo filho de varredura | Mesmo padrão do `AudioPluginHost` de exemplo do JUCE |
+| Grafo de processamento (faixas, inserts, envios, master) | `AudioProcessorGraph` | Substitui o grafo que o `engine.js` monta hoje em Web Audio |
+| Posição, BPM e compasso para os plugins | `AudioPlayHead` | Necessário para plugins sincronizados (delays, arpejadores) |
+| Ler e gravar WAV, AIFF, FLAC, OGG, MP3 (leitura) | `juce_audio_formats`: `AudioFormatManager` | Exportar MP3 e formatos de vídeo exige FFmpeg ou LAME à parte |
+| Reamostragem de qualidade | `juce_dsp`, `LagrangeInterpolator`, `WindowedSincInterpolator` | Melhor que a reamostragem linear atual |
+| Efeitos internos (filtros, compressor, reverb) | `juce_dsp` | Para portar `realtime.js` para C++ |
+| Janelas nativas dos plugins | `AudioProcessorEditor` em `DocumentWindow` | Abertas pelo motor, fora do Electron |
+| **Plugins CLAP** | **Não suportado** pelo JUCE como host | Se for necessário, usar o CLAP SDK direto ao lado do JUCE (fase futura) |
+| Projeto em SQLite (estilo `.aup3`) | Não tem | Usar SQLite à parte, se for seguir esse formato |
+
+**Licença:** o JUCE é usado sob **AGPLv3**, e o Raven é **código aberto sob
+AGPLv3** (decisão registrada na [seção 7](#7-licenças)). Não é preciso licença
+comercial do JUCE.
+
+### 4.2 Por que processo separado e não addon N-API
+
+A pesquisa inicial sugeria compilar o motor como um addon `.node`
+(node-addon-api) carregado pelo Electron. Com o JUCE isso não é uma boa ideia:
+
+1. **O JUCE precisa do próprio laço de mensagens** (`MessageManager`). As janelas
+   dos plugins, a varredura e vários plugins dependem dele. Dentro do Electron, o
+   thread principal já é do Chromium/Node. No macOS o laço de mensagens precisa
+   estar no thread principal do processo, então lá é **impossível**. No Windows
+   funciona com gambiarras.
+2. **Isolamento de falhas:** um plugin com defeito derruba o processo onde está.
+   Num processo separado, o Electron mostra um aviso e reinicia o motor; a
+   interface e o projeto aberto continuam vivos.
+3. **Compilação mais simples:** o motor é um projeto CMake comum do JUCE. Não
+   precisa compilar contra os cabeçalhos do Node/Electron, nem usar `cmake-js`
+   ou `@electron/rebuild`, e atualizar o Electron não exige recompilar o motor.
+4. **Prioridade de thread:** o motor pode pedir prioridade de tempo real para o
+   thread de áudio sem disputar com o Chromium.
+
+O custo é a comunicação entre processos, que é aceitável porque **o áudio não
+precisa ir para a interface** durante a reprodução: só comandos, posição e
+medidores. A interface só recebe áudio para desenhar o waveform, e mesmo isso
+pode virar resumos (min/max/rms) calculados pelo motor.
+
+### 4.3 Arquitetura com JUCE
+
+```mermaid
+flowchart TB
+  subgraph EL["Aplicativo Electron"]
+    direction TB
+    R["Renderer: Quasar / Vue<br/>Pinia + src/audio/plugins.js"]
+    PR["Preload<br/>contextBridge: window.audio"]
+    MN["Main: electron-main.js<br/>engine-host.js"]
+    R <--> PR <-- "ipcRenderer.invoke / on" --> MN
+  end
+
+  subgraph ENG["raven-engine.exe: app JUCE sem janela principal"]
+    direction TB
+    CMD["Thread de mensagens JUCE<br/>MessageManager<br/>lê comandos, aplica no modelo"]
+    GR["AudioProcessorGraph<br/>faixas, inserts, master"]
+    AD["Thread de áudio<br/>AudioDeviceManager"]
+    PE["Janelas nativas<br/>dos plugins"]
+    CMD --> GR --> AD
+    CMD --> PE
+  end
+
+  SCN["Processo de varredura<br/>raven-engine --scan"]
+
+  MN <-- "stdin/stdout: JSON por linha<br/>comandos e eventos" --> CMD
+  MN <-- "arquivos temporários Float32<br/>(Fase 1: aplicar efeito)" --> CMD
+  MN -. "inicia, com timeout" .-> SCN
+  SCN -. "known-plugins.xml" .-> CMD
+  AD <--> HW(["Interface de áudio<br/>ASIO / WASAPI"])
+  GR <--> PL["Plugins VST3 / LV2"]
+```
+
+- **Canal de controle:** stdin/stdout do processo, uma mensagem JSON por linha
+  (formato em `engine/src/Protocol.h`). Simples de depurar e de testar sem interface.
+- **Canal de dados (Fase 1):** o trecho de áudio vai e volta por **arquivos
+  temporários** Float32 planares (um canal inteiro depois do outro), e o JSON só
+  leva os caminhos. Para aplicar um efeito offline isso é rápido e fácil de
+  depurar. Mandar áudio dentro de JSON seria lento demais.
+- **Canal de dados (Fase 2 em diante):** com reprodução em tempo real e resumos
+  de waveform, trocar os arquivos por um pipe nomeado (`\\.\pipe\raven-engine-<pid>`
+  no Windows, socket Unix no macOS/Linux) com mensagens binárias.
+- **`SharedArrayBuffer` não funciona entre processos.** A pesquisa inicial
+  sugeria usá-lo entre o C++ e a interface, mas ele só compartilha memória dentro
+  de um mesmo processo. Entre o motor e o Electron, o equivalente seria memória
+  compartilhada do sistema operacional, que só vale a pena se o pipe se mostrar lento.
+- **O motor é um "GUI app" do JUCE sem janela principal** (`juce_add_gui_app` com
+  um `JUCEApplication` que não cria janela), e não um "console app". O console
+  app do JUCE não roda o laço de mensagens, e sem ele as janelas dos plugins não
+  abrem.
+
+### 4.4 Estrutura de pastas (implementada na Fase 1)
+
+```
+REA/
+├─ LICENSE                         ← AGPLv3
+├─ engine/                         ← motor JUCE (C++)
+│  ├─ CMakeLists.txt               ← JUCE_PLUGINHOST_VST3/LV2/AU, ASIO opcional
+│  ├─ third_party/JUCE/            ← submódulo git, fixado na tag 9.0.5
+│  ├─ src/
+│  │  ├─ Main.cpp                  ← JUCEApplication sem janela; modo normal e --scan
+│  │  ├─ Protocol.h/.cpp           ← JSON por linha no stdin/stdout
+│  │  ├─ Scanner.h/.cpp            ← varredura com PluginDirectoryScanner
+│  │  └─ PluginHost.h/.cpp         ← instâncias, janelas nativas, processamento offline
+│  ├─ build/                       ← gerado pelo CMake (ignorado pelo git)
+│  └─ bin/                         ← raven-engine(.exe) copiado após compilar (ignorado)
+├─ src-electron/
+│  ├─ electron-main.js             ← registra os ipcMain.handle('engine:*')
+│  ├─ electron-preload.js          ← expõe window.audio
+│  └─ engine-host.js               ← inicia/reinicia o motor, varredura, áudio temporário
+└─ src/
+   ├─ audio/plugins.js             ← cliente de window.audio no renderer
+   └─ components/PluginEffectDialog.vue ← Efeito → Plugin (VST3 / LV2)…
+```
+
+O motor usa CMake em vez do Projucer: é o caminho recomendado pelo JUCE hoje e
+permite compilar com o mesmo comando em CI e na máquina de desenvolvimento.
+
+### 4.5 Ligação com o Electron (como está implementado)
+
+- **`src-electron/engine-host.js`**, no processo main:
+  - inicia o motor com `child_process.spawn` **no primeiro pedido** (quem não usa
+    plugins não paga nada);
+  - casa respostas pelo `id`, repassa eventos ao renderer com
+    `webContents.send('engine:event', ...)`;
+  - se o motor cair, rejeita os pedidos pendentes, avisa a interface
+    (`engine.exit`) e o reinicia (até 3 vezes seguidas);
+  - a varredura roda em outro processo (`raven-engine --scan`). Se ele cair ou
+    passar 60 s sem progresso, é encerrado e reiniciado: o "dead man's pedal" do
+    JUCE coloca o plugin culpado na lista negra e a varredura continua (até 10 tentativas);
+  - encerra o motor no `before-quit`, fechando o stdin.
+- **Caminhos** vão por variáveis de ambiente, não pela linha de comando:
+  `RAVEN_PLUGIN_CACHE` (lista de plugins, em `<userData>/plugins/known-plugins.xml`)
+  e `RAVEN_SCAN_PEDAL`. `RAVEN_ENGINE_PATH` força outro executável do motor, útil
+  para depurar.
+- **`src-electron/electron-preload.js`** expõe `window.audio` com `contextBridge`:
+  `engineStatus()`, `request(cmd, args)`, `scanPlugins({ full })`,
+  `process(instanceId, channels, sampleRate)` e `onEvent(callback)`. O main só aceita
+  os comandos de uma lista fechada. Nada de `nodeIntegration`.
+- **Comandos do motor:** `ping`, `plugins.list`, `fx.create`, `fx.setParam`,
+  `fx.openEditor`, `fx.closeEditor`, `fx.process`, `fx.destroy`. Eventos:
+  `ready`, `scan.progress`, `scan.failed`, `scan.done`, `scan.crashed`,
+  `fx.paramChanged` (mexeram na janela do plugin), `fx.editorClosed`, `engine.exit`.
+- **Empacotamento:** um executável não roda de dentro do `app.asar`. O
+  `quasar.config.js` inclui `engine/bin/raven-engine.exe` como `extraResource`
+  quando ele existe, e em produção o motor é procurado em `process.resourcesPath`.
+  No modo dev, o caminho é `engine/bin/` direto.
+- **Processamento offline:** blocos de 512 amostras, `setNonRealtime(true)`, e
+  a latência informada pelo plugin é compensada (o trecho processado fica
+  alinhado com o original). Plugin só mono numa faixa estéreo processa um canal
+  por vez.
+- **Pré-rolo de 0,5 s:** antes do trecho, o motor passa meio segundo de silêncio
+  pelo plugin e descarta a saída. Muitos plugins suavizam mudanças de parâmetro
+  (o kHs Gain leva ~50 ms para chegar ao valor novo); sem o pré-rolo, o começo
+  de cada trecho processado saía com o valor antigo.
+- **Parâmetros discretos** (Bypass, modos, presets) viram listas no diálogo. Como
+  plugins VST3 não preenchem `getAllValueStrings()`, o motor monta os textos com
+  o `getText()` de cada passo.
+
+### 4.6 Ambiente de desenvolvimento (Windows)
+
+| Ferramenta | Para quê |
+|---|---|
+| Visual Studio 2022 Build Tools, carga "Desenvolvimento para desktop com C++" | Compilador MSVC e SDK do Windows |
+| CMake 3.22 ou mais novo | Gera o projeto do motor |
+| Git | Submódulo do JUCE |
+| ASIO | Não precisa baixar: o JUCE 9 já traz o ASIO SDK 2.3 (opção GPLv3, ver seção 7). Liga com `cmake ... -DRAVEN_ASIO=ON`. Sem ele, o motor usa WASAPI |
+| Ninja (opcional) | Compilação mais rápida |
+
+Python e `node-gyp` **não** são necessários nesse modelo, porque o motor não é
+um addon do Node.
+
+---
+
+## 5. Telas (GUI) dos plugins
 
 - Cada plugin desenha a própria janela nativa (HWND no Windows, NSView no
   macOS, X11 no Linux). **Não é viável embutir essa janela dentro da página
   Electron.**
 - Abordagens:
-  1. Abrir a janela do plugin como **janela nativa separada**, criada pelo motor.
-     É o padrão das DAWs.
+  1. Abrir a janela do plugin como **janela nativa separada**, criada pelo motor
+     JUCE (`plugin->createEditorAndMakeActive()` dentro de uma `DocumentWindow`).
+     É o padrão das DAWs. ✅ Implementado em `engine/src/PluginHost.cpp`
+     (`PluginWindow`). Hoje a janela fica "sempre no topo". ⏳ Melhoria futura:
+     o main passar o handle da janela do app (`getNativeWindowHandle()`) para o
+     motor usar como janela dona, para ela minimizar junto com o app.
   2. **Tela genérica** gerada a partir dos parâmetros do plugin (como a opção
      "Generic UI" do Audacity e o nosso `RealtimeEffectsPanel.vue`). Útil para
-     plugins sem tela e para automação.
+     plugins sem tela e para automação. ✅ Duas versões: a do diálogo
+     `PluginEffectDialog.vue` e, no motor, a `GenericAudioProcessorEditor` do
+     JUCE para plugins sem interface própria.
 - Os parâmetros alterados na janela nativa precisam voltar para o store da
   interface (evento `fx.paramChanged`), para manter undo e automação.
+  ✅ Na Fase 1 o evento atualiza o diálogo; o undo vem do `store.applyEffect`.
+- Só os parâmetros **automatizáveis** são listados. Sem esse filtro, plugins
+  VST3 como o kHs Gain mostravam milhares de controladores MIDI internos.
 
 ---
 
-## 5. Plataforma, desempenho e estabilidade
+## 6. Plataforma, desempenho e estabilidade
 
 - **Arquitetura e SO:** o plugin precisa bater com o app (Windows x64, macOS
   arm64/x64 universal, Linux x64). Plugins 32-bit exigem uma ponte (processo
@@ -432,9 +647,10 @@ Regras importantes:
   callback. O tamanho de buffer é configurável (64 a 1024 amostras).
 - **Compensação de latência (PDC):** plugins informam latência; o motor
   alinha as faixas.
-- **Plugins que travam:** considere hospedagem fora do processo (Opção B) para
-  isolar falhas, ou ao menos tratar exceções e marcar o plugin como problemático
-  (o Audacity tem um diálogo de plugins incompatíveis: `src/IncompatiblePluginsDialog.cpp`).
+- **Plugins que travam:** com o motor em processo separado (seção 4.2), uma falha
+  derruba só o motor, que o Electron reinicia. Além disso, marque o plugin como
+  problemático para não carregá-lo de novo automaticamente (o Audacity tem um
+  diálogo de plugins incompatíveis: `src/IncompatiblePluginsDialog.cpp`).
 - **Varredura de plugins:** fazer em processo separado, com timeout e cache,
   porque alguns plugins travam ao carregar.
 - **Assinatura e notarização:** instaladores no macOS precisam de notarização;
@@ -442,45 +658,129 @@ Regras importantes:
 
 ---
 
-## 6. Licenças
+## 7. Licenças
 
-| Item | Licença / situação |
-|---|---|
-| **VST2** | A Steinberg **encerrou o SDK em 2018** e não concede mais licença nova. Hospedar VST2 só é seguro para quem já tinha acordo assinado. Cabeçalhos reimplementados ("vestige", usado por LMMS e outros) são juridicamente arriscados. **Recomendação: não suportar VST2** ou tratar como opcional, após análise jurídica |
-| **VST3 SDK** | Duas opções: GPLv3 ou licença proprietária gratuita da Steinberg (exige aceitar os termos e usar o logo conforme as regras) |
-| **ASIO SDK** | Licença própria da Steinberg (gratuita, com termos) |
-| **LV2 / lilv** | ISC (permissiva) |
-| **LADSPA** | LGPL (cabeçalho) |
-| **CLAP** | MIT |
-| **JUCE** | Comercial ou AGPLv3. Um produto fechado exige licença comercial |
-| **Tracktion Engine** | Comercial ou GPLv3 |
-| **Carla** | GPLv2+. Usar como biblioteca obriga o app a ser compatível com a GPL; como processo separado, a análise é diferente |
-| **Electron** | MIT |
+### Decisão
 
-Antes de escolher a pilha, decida o modelo de licença do produto (código
-aberto ou fechado). Isso elimina ou exige licenças comerciais (JUCE, Tracktion).
+- **O Raven Audio Editor é código aberto, sob AGPLv3.** Isso vale para o projeto
+  inteiro: interface Quasar, `src-electron` e o motor `engine/`.
+- **O JUCE é usado sob a licença AGPLv3**, sem licença comercial.
+
+### O que isso exige
+
+1. ✅ **Publicar o código-fonte** de toda versão distribuída (interface e motor), na
+   mesma versão do instalador: repositório público
+   https://github.com/GuiPassoskt/RavenAudioEditor. O build grava o commit
+   (`import.meta.env.GIT_COMMIT`) e a tela "Sobre" aponta para o código exato
+   daquela versão. **Gere instaladores só a partir de commits já enviados ao GitHub**,
+   senão o link aponta para um commit que não existe lá.
+2. ✅ **Arquivo `LICENSE`** com o texto da AGPLv3 na raiz do repositório e o campo
+   `"license": "AGPL-3.0-or-later"` no `package.json` e no `src-electron/package.json`.
+3. ✅ **Avisos de terceiros:** `npm run licenses` gera
+   `src/legal/third-party-licenses.json` (41 componentes: interface, Electron e
+   motor JUCE, com o texto de cada licença), a partir do `node_modules` e do
+   inventário SPDX do JUCE. A tela **Ajuda → Sobre** mostra a licença AGPLv3, o
+   aviso de ausência de garantia, o link para o código-fonte e essa lista. Rode
+   `npm run licenses` de novo ao adicionar ou atualizar dependências. O Chromium
+   embutido no Electron tem as licenças em `LICENSES.chromium.html`, que o
+   empacotador já coloca ao lado do executável.
+4. **Toda dependência nova precisa ser compatível com a AGPLv3.** Pode: MIT, BSD,
+   ISC, Apache 2.0, LGPL, GPLv3 e "GPLv2 ou posterior". Não pode: "GPLv2
+   somente", licenças proprietárias e SDKs com termos que proíbam redistribuir.
+5. A cláusula de rede da AGPL (seção 13) só pesa se o Raven um dia for oferecido
+   como serviço online: nesse caso, os usuários remotos também têm direito ao código.
+
+### Situação de cada item com a AGPLv3
+
+| Item | Licença | Com o Raven em AGPLv3 |
+|---|---|---|
+| **JUCE** | AGPLv3 ou comercial | ✅ Usar sob AGPLv3 |
+| **VST3 SDK** 3.8 (vem dentro do JUCE) | **MIT** desde a versão 3.8 (antes era GPLv3 ou proprietária) | ✅ Compatível. O **logo** VST continua sujeito às regras de marca da Steinberg |
+| **ASIO SDK** 2.3 (vem dentro do JUCE 9) | Licença ASIO da Steinberg **ou GPLv3** | ✅ Usar sob GPLv3, que a AGPLv3 permite combinar (seção 13 da AGPLv3). Versões antigas do SDK eram só proprietárias, por isso o Audacity distribui versões sem ASIO |
+| **VST2** | SDK encerrado em 2018, sem licença nova | ❌ Não suportar. Cabeçalhos reimplementados ("vestige") são juridicamente arriscados |
+| **LV2 / lilv** | ISC | ✅ |
+| **LADSPA** | LGPL (cabeçalho) | ✅ |
+| **CLAP** | MIT | ✅ (se for adicionado no futuro) |
+| **Tracktion Engine** | GPLv3 ou comercial | ✅ Sob GPLv3, se um dia for usado |
+| **Carla** | GPLv2 ou posterior | ✅ |
+| **Electron, Quasar, Vue, Pinia** | MIT | ✅ |
+| **FFmpeg** (se for usado para exportar MP3/vídeo) | LGPL ou GPL, conforme a compilação | ✅ Evite compilações com codecs "nonfree" |
+| **Plugins de terceiros** (Kilohearts, Melda etc.) | Proprietárias | ✅ Não fazem parte do Raven: o usuário instala e o motor só carrega em tempo de execução, como no Ardour e no Audacity. O Raven não pode **redistribuir** esses plugins no instalador |
 
 ---
 
-## 7. Primeiros passos práticos (Fase 0 e 1)
+## 8. Primeiros passos práticos (Fase 0 e 1)
 
-1. `npx quasar mode add electron`, e depois testar `quasar dev -m electron` e
-   `quasar build -m electron`.
-2. Criar o addon nativo com **node-addon-api** + **cmake-js** (ou `node-gyp`), e
-   compilar contra a versão de Node do Electron (`@electron/rebuild`).
-3. Expor ao renderer só por `contextBridge` no preload (sem `nodeIntegration`),
-   com uma API mínima: `plugins.scan()`, `plugins.process(pluginId, params, channels, rate)`.
-4. Implementar a varredura de VST3 (pastas padrão: `C:\Program Files\Common Files\VST3`,
-   `/Library/Audio/Plug-Ins/VST3`, `~/.vst3`) e LV2 (`LV2_PATH`).
-5. No editor atual, criar um efeito "Plugin…" no menu Efeito que chama
-   `plugins.process` sobre a seleção, aproveitando `store.applyEffect`.
-6. Validar com plugins gratuitos: por exemplo os do pacote **LSP** (LV2/VST3/CLAP),
-   **Airwindows** e **Surge XT** (instrumento VST3/CLAP).
+1. ✅ Modo Electron configurado (`@quasar/app-vite` v3). Testado com
+   `npm run dev:electron` e `npm run build:electron`.
+2. ✅ `engine/` com o JUCE 9.0.5 como submódulo e o motor da seção 4.4.
+3. ✅ `src-electron/engine-host.js` (spawn, leitura por linha, reinício) e
+   `window.audio` no preload.
+4. ✅ Varredura com `PluginDirectoryScanner` nas pastas padrão de cada formato
+   (`C:\Program Files\Common Files\VST3`, `/Library/Audio/Plug-Ins/VST3`,
+   `~/.vst3`, LV2 etc.), em processo separado, com timeout e cache em disco.
+5. ✅ `fx.process` (Opção C): processamento offline em blocos de 512 amostras,
+   com compensação de latência.
+6. ✅ **Efeito → Plugin (VST3 / LV2)…** no editor (só aparece no app desktop):
+   escolher o plugin, ajustar os parâmetros na tela genérica ou na janela nativa
+   do plugin, ouvir a prévia de 6 s e aplicar na seleção, com desfazer.
+7. ✅ **Motor compilado e validado** com MSVC (Build Tools 2022, 17.14) e
+   JUCE 9.0.5, sem a interface:
+   - a varredura encontrou 90 plugins (81 VST3 de efeito, 9 instrumentos LV2),
+     sem nenhum travar;
+   - `kHs Gain` com Gain em −18 dB reduziu o RMS de 0,3536 para 0,0445, exatamente
+     o valor teórico; MCompressor e Reverb também processaram. 1 s de áudio
+     estéreo leva de 10 a 140 ms;
+   - a janela nativa do plugin abre e fecha, e mexer num parâmetro gera
+     `fx.paramChanged`;
+   - o `npm run build:electron` inclui `raven-engine.exe` em `resources/`.
+
+   Só parâmetros automatizáveis são listados: sem esse filtro, o kHs Gain
+   mostrava 2083 parâmetros (2080 eram controladores MIDI internos do VST3).
+
+   Para compilar numa máquina nova:
+   1. instalar o ambiente da [seção 4.6](#46-ambiente-de-desenvolvimento-windows);
+   2. depois de clonar o repositório: `git submodule update --init`;
+   3. `npm run build:engine` (gera `engine/bin/raven-engine.exe`);
+   4. teste rápido sem interface, no Git Bash:
+      `echo '{"id":1,"cmd":"ping"}' | engine/bin/raven-engine.exe` deve
+      responder `{"id":1,"ok":true,"result":{...}}`.
+8. ✅ **Testado pela interface** (18/11/2026), controlando o app pelo protocolo de
+   depuração do Chromium, no app empacotado e no `npm run dev:electron`:
+   - Gerar → Tom, Ctrl+A, Efeito → Plugin (VST3 / LV2)…: o diálogo abre, lista os
+     plugins e lembra o último usado;
+   - trocar de plugin pela busca, ajustar o Gain do kHs Gain no slider (−18 dB),
+     Prévia, **Interface do plugin** (a janela nativa abre por cima do app,
+     mostrando o mesmo valor) e Aplicar;
+   - faixa mono e faixa estéreo: o pico foi de 0,8 para 0,1006 em todo o trecho,
+     nos dois canais;
+   - Ctrl+Z volta ao áudio original, Ctrl+Y reaplica; o histórico registra
+     "Aplicado kHs Gain"; a janela nativa fecha junto com o diálogo;
+   - o motor é encontrado em `engine/bin/` (dev) e em `resources/` (empacotado).
+
+   Problemas achados nesse teste e já corrigidos:
+   - Bypass e "mode" apareciam como slider → agora são listas;
+   - o começo do trecho saía com o valor antigo do parâmetro → pré-rolo de 0,5 s
+     (seção 4.5);
+   - o modo dev abria em branco (`process is not defined` no roteador): o
+     `@quasar/app-vite` v3 trocou `process.env` por `import.meta.env`. Corrigido
+     em `src/router/index.js` e `SplashDialog.vue`, e `build.env` virou
+     `build.defineEnv` no `quasar.config.js`.
+9. Validar com plugins gratuitos.
+   - ✅ No motor: **Kilohearts Essentials** (kHs Gain), **MeldaProduction**
+     (MCompressor) e **MuseFX** (Reverb) carregaram e processaram áudio
+     (resultados no passo 7).
+   - ⏳ Ainda não testados: **LSP** (LV2/VST3) e **Airwindows**. O **Surge XT**
+     é instrumento: só vai aparecer quando houver faixas de instrumento (Fase 4),
+     porque o diálogo da Fase 1 lista apenas efeitos.
 
 ---
 
-## 8. Referências
+## 9. Referências
 
+- JUCE: https://github.com/juce-framework/JUCE · CMake API do JUCE:
+  `docs/CMake API.md` no repositório · exemplo de host:
+  `extras/AudioPluginHost` (varredura isolada, grafo, janelas de plugin)
 - VST3 SDK: https://github.com/steinbergmedia/vst3sdk
 - LV2: https://lv2plug.in · lilv: https://drobilla.net/software/lilv
 - CLAP: https://github.com/free-audio/clap
@@ -489,5 +789,6 @@ aberto ou fechado). Isso elimina ou exige licenças comerciais (JUCE, Tracktion)
 - RtAudio: https://github.com/thestk/rtaudio · PortAudio: https://www.portaudio.com
 - Web Audio Modules 2.0: https://github.com/webaudiomodules
 - Quasar + Electron: https://quasar.dev/quasar-cli-vite/developing-electron-apps/introduction
-- node-addon-api: https://github.com/nodejs/node-addon-api
+- Electron `child_process` e `contextBridge`: https://www.electronjs.org/docs/latest/tutorial/context-isolation
+- node-addon-api (só se um dia houver addon N-API): https://github.com/nodejs/node-addon-api
 - Código de hospedagem no Audacity 3.7.9: `refs/audacity/libraries/lib-vst3`, `lib-lv2`, `lib-ladspa`

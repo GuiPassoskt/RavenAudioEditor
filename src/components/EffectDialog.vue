@@ -126,8 +126,8 @@ async function apply () {
     localStorage.setItem(storageKey(def.id), JSON.stringify(persisted))
   } catch { /* storage indisponível */ }
   engine.stopPreview()
-  const ok = await guard(() => {
-    if (kind === 'effect') store.applyEffect(def, values)
+  const ok = await guard(async () => {
+    if (kind === 'effect') await store.applyEffect(def, values)
     else store.generate(def, values)
     return true
   }, { loading: true })

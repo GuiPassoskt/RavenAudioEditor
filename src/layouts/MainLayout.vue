@@ -25,6 +25,7 @@
     </q-footer>
 
     <EffectDialog />
+    <PluginEffectDialog v-if="hasNativeEngine" />
     <AnalysisDialogs />
     <InfoDialogs />
     <SplashDialog />
@@ -33,11 +34,13 @@
 
 <script setup>
 import { useUiStore } from 'src/stores/ui'
+import { hasNativeEngine } from 'src/audio/plugins'
 import MenuBar from 'components/MenuBar.vue'
 import MainToolbar from 'components/MainToolbar.vue'
 import SelectionBar from 'components/SelectionBar.vue'
 import HistoryPanel from 'components/HistoryPanel.vue'
 import EffectDialog from 'components/EffectDialog.vue'
+import PluginEffectDialog from 'components/PluginEffectDialog.vue'
 import AnalysisDialogs from 'components/AnalysisDialogs.vue'
 import InfoDialogs from 'components/InfoDialogs.vue'
 import RealtimeEffectsPanel from 'components/RealtimeEffectsPanel.vue'

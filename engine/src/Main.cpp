@@ -1,0 +1,90 @@
+// raven-engine: motor de áudio nativo do Raven Audio Editor.
+//
+// É um app JUCE sem janela principal (e não um "console app"), porque as
+// janelas dos plugins precisam do laço de mensagens do JUCE. O Electron o inicia
+// e conversa com ele pelo stdin/stdout (Protocol.h).
+//
+//   raven-engine          modo normal: atende comandos até o stdin fechar
+//   raven-engine --scan   procura plugins, grava a lista e termina
+//
+// Caminhos vêm por variáveis de ambiente, para não depender de aspas na linha
+// de comando: RAVEN_PLUGIN_CACHE (lista de plugins) e RAVEN_SCAN_PEDAL.
+
+#include "PluginHost.h"
+#include "Protocol.h"
+#include "Scanner.h"
+
+#include <juce_gui_basics/juce_gui_basics.h>
+
+class RavenEngineApplication final : public juce::JUCEApplication
+{
+public:
+    const juce::String getApplicationName() override    { return JUCE_APPLICATION_NAME_STRING; }
+    const juce::String getApplicationVersion() override { return JUCE_APPLICATION_VERSION_STRING; }
+    bool moreThanOneInstanceAllowed() override          { return true; }
+
+    void initialise (const juce::String&) override
+    {
+        raven::initStdio();
+
+        const juce::File cacheFile (juce::SystemStats::getEnvironmentVariable ("RAVEN_PLUGIN_CACHE", {}));
+
+        if (getCommandLineParameterArray().contains ("--scan"))
+        {
+            const juce::File pedal (juce::SystemStats::getEnvironmentVariable ("RAVEN_SCAN_PEDAL", {}));
+            setApplicationReturnValue (raven::runScan (cacheFile, pedal) ? 0 : 1);
+            quit();
+            return;
+        }
+
+        host = std::make_unique<raven::PluginHost> (cacheFile);
+
+        raven::startStdinReader ([this] (const juce::String& line) { handleLine (line); },
+                                 [this] { quit(); });
+
+        raven::sendEvent ("ready", raven::object ({ { "version", getApplicationVersion() } }));
+    }
+
+    void shutdown() override
+    {
+        host.reset();
+    }
+
+    void systemRequestedQuit() override
+    {
+        quit();
+    }
+
+    void anotherInstanceStarted (const juce::String&) override {}
+
+private:
+    void handleLine (const juce::String& line)
+    {
+        const auto message = juce::JSON::parse (line);
+        const auto id = message["id"];
+        const auto cmd = message["cmd"].toString();
+
+        if (host == nullptr)
+            return;
+
+        if (cmd == "quit")
+        {
+            raven::sendResult (id, true);
+            quit();
+            return;
+        }
+
+        try
+        {
+            raven::sendResult (id, host->handle (cmd, message));
+        }
+        catch (const std::exception& e)
+        {
+            raven::sendError (id, juce::String::fromUTF8 (e.what()));
+        }
+    }
+
+    std::unique_ptr<raven::PluginHost> host;
+};
+
+START_JUCE_APPLICATION (RavenEngineApplication)

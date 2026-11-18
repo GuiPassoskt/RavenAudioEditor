@@ -122,12 +122,12 @@ const ui = useUiStore()
 
 const appVersion = pkg.version
 const buildDate = (() => {
-  const d = new Date(process.env.BUILD_DATE || Date.now())
+  const d = new Date(import.meta.env.BUILD_DATE || Date.now())
   return d.toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })
 })()
 const runtime = navigator.userAgent.includes('Electron')
   ? 'Desktop (Electron)'
-  : `Navegador (SPA)${process.env.DEV ? ' · desenvolvimento' : ''}`
+  : `Navegador (SPA)${import.meta.env.QUASAR_DEV ? ' · desenvolvimento' : ''}`
 
 const info = reactive({ formats: [] })
 const progress = ref(0)

@@ -669,14 +669,15 @@ export const useProjectStore = defineStore('project', {
       return targets
     },
 
-    applyEffect (def, params) {
+    // def.process pode ser assíncrono (plugins nativos processam no motor C++).
+    async applyEffect (def, params) {
       const targets = this.requireAudioTargets()
       let newLength = null
       for (const t of targets) {
         const [s0, s1] = this.regionOf(t)
         if (s1 <= s0) continue
         const region = t.channels.map(ch => ch.slice(s0, s1))
-        const out = def.process(region, params, { rate: this.rate })
+        const out = await def.process(region, params, { rate: this.rate })
         setChannels(t, t.channels.map((ch, c) => replaceRange(ch, s0, s1, out[c])))
         if (newLength === null) newLength = out[0].length
       }

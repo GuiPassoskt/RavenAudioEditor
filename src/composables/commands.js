@@ -9,6 +9,7 @@ import { useProjectStore } from 'src/stores/project'
 import { useUiStore } from 'src/stores/ui'
 import { EFFECTS, GENERATORS, ANALYZERS } from 'src/audio/effects'
 import { pickFiles } from 'src/audio/fileio'
+import { hasNativeEngine } from 'src/audio/plugins'
 
 export function notifyError (e) {
   Notify.create({ type: 'negative', message: e?.message ?? String(e), position: 'bottom', timeout: 3500 })
@@ -122,6 +123,13 @@ export function useCommands () {
       run: () => { ui.fxTarget = ui.fxTarget !== null ? null : p.requireTargets()[0].id }
     },
     masterEffects: { label: 'Efeitos do master…', icon: 'mdi-tune-variant', run: () => { ui.fxTarget = 'master' } },
+    pluginEffect: {
+      label: 'Plugin (VST3 / LV2)…', icon: 'mdi-puzzle-outline',
+      run: () => {
+        p.requireAudioTargets()
+        ui.pluginEffect = true
+      }
+    },
 
     // Transporte
     playStop: { label: 'Reproduzir / Parar', icon: 'play_arrow', keys: 'Space', run: () => p.playStop() },
@@ -193,7 +201,7 @@ export function useCommands () {
     { label: 'Transporte', items: ['playStop', 'pause', 'stop', 'record', '-', 'skipStart', 'skipEnd', 'loop'] },
     { label: 'Faixas', items: ['newMono', 'newStereo', 'newMidi', '-', 'pianoRoll', 'renderMidi', '-', 'mixRender', 'stereoToMono', '-', 'removeTracks'] },
     { label: 'Gerar', items: GENERATORS.map(d => `gen:${d.id}`) },
-    { label: 'Efeito', items: ['trackEffects', 'masterEffects', '-', ...EFFECTS.map(d => `fx:${d.id}`)] },
+    { label: 'Efeito', items: ['trackEffects', 'masterEffects', ...(hasNativeEngine ? ['-', 'pluginEffect'] : []), '-', ...EFFECTS.map(d => `fx:${d.id}`)] },
     { label: 'Analisar', items: ANALYZERS.map(d => `an:${d.id}`) },
     { label: 'Ajuda', items: ['splash', 'shortcuts', 'about'] }
   ]
