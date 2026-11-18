@@ -108,6 +108,9 @@ public:
         const auto type = state["type"].toString();
         usedEffects.insert (uid);
 
+        if (type == "plugin")
+            return pluginEffect (uid, state);
+
         auto& fx = engine.effects[uid];
         if (fx != nullptr && fx->type == type && fx->getSampleRate() == rate)
         {
@@ -124,9 +127,71 @@ public:
         return fx;
     }
 
+    // Plugin numa cadeia: reaproveita a instância enquanto o plugin e a taxa não mudarem.
+    RealtimeEffect::Ptr pluginEffect (const juce::String& uid, const juce::var& state)
+    {
+        const auto pluginId = state["pluginId"].toString();
+        auto& fx = engine.effects[uid];
+        auto* existing = dynamic_cast<PluginEffect*> (fx.get());
+
+        if (existing == nullptr || existing->pluginId != pluginId || existing->getSampleRate() != rate)
+        {
+            // Plugin que já falhou não é carregado de novo a cada mudança do projeto.
+            if (engine.failedPlugins.count (uid) && engine.failedPlugins[uid] == pluginId)
+                return nullptr;
+
+            juce::String error;
+            auto instance = engine.plugins.createPlugin (pluginId, rate, maxBlock, error);
+            if (instance == nullptr)
+            {
+                engine.failedPlugins[uid] = pluginId;
+                fx = nullptr;
+                sendEvent ("chain.pluginError", object ({ { "uid", uid }, { "message", error } }));
+                return nullptr;
+            }
+
+            engine.failedPlugins.erase (uid);
+            PluginEffect::Ptr created = new PluginEffect (uid, pluginId, std::move (instance), false);
+            created->onLatencyChanged = [e = &engine] { e->rebuildGraph(); };
+            created->setState ({}, state["enabled"]);
+            applyPluginState (*created, state);
+            created->prepare (rate, maxBlock);
+            fx = created.get();
+            return fx;
+        }
+
+        existing->setState ({}, state["enabled"]);
+        applyPluginState (*existing, state);
+        return fx;
+    }
+
+    // O estado só vem quando a interface tem uma versão nova (abrir projeto, desfazer).
+    static void applyPluginState (PluginEffect& fx, const juce::var& state)
+    {
+        if (! state.hasProperty ("state"))
+            return;
+
+        const auto version = static_cast<juce::int64> (state["stateVersion"]);
+        if (version == fx.appliedVersion)
+            return;
+
+        fx.appliedVersion = version;
+        const auto data = state["state"].toString();
+        if (data.isEmpty())
+            fx.restoreInitialState();
+        else
+            fx.applyState (data);
+    }
+
     // Esquece o que saiu do projeto (o grafo antigo segura até sair de uso).
     void prune()
     {
+        // Slot de plugin removido: fecha a janela dele.
+        for (auto& [uid, fx] : engine.effects)
+            if (! usedEffects.count (uid))
+                if (auto* plugin = dynamic_cast<PluginEffect*> (fx.get()))
+                    plugin->closeEditor();
+
         const auto eraseUnused = [] (auto& map, const std::set<juce::String>& used)
         {
             for (auto it = map.begin(); it != map.end();)
@@ -135,6 +200,7 @@ public:
         eraseUnused (engine.trackStates, usedTracks);
         eraseUnused (engine.notesCache, usedTracks);
         eraseUnused (engine.effects, usedEffects);
+        eraseUnused (engine.failedPlugins, usedEffects);
     }
 
 private:
@@ -169,6 +235,9 @@ public:
 
     RealtimeEffect::Ptr effect (const juce::var& state) override
     {
+        if (state["type"].toString() == "plugin")
+            return pluginEffect (state);
+
         auto fx = RealtimeEffect::create (state["type"].toString());
         if (fx != nullptr)
         {
@@ -182,13 +251,38 @@ public:
     std::vector<RealtimeEffect::Ptr> created;
 
 private:
+    // Instância nova do plugin, com o estado da instância ao vivo se ela existir
+    // (pega ajustes feitos há menos de 400 ms, que a interface ainda não recebeu).
+    RealtimeEffect::Ptr pluginEffect (const juce::var& state)
+    {
+        const auto uid = state["uid"].toString();
+        juce::String error;
+        auto instance = engine.plugins.createPlugin (state["pluginId"].toString(), rate, maxBlock, error);
+        if (instance == nullptr)
+        {
+            sendEvent ("chain.pluginError", object ({ { "uid", uid }, { "message", error } }));
+            return nullptr;
+        }
+
+        PluginEffect::Ptr fx = new PluginEffect (uid, state["pluginId"].toString(), std::move (instance), true);
+        fx->setState ({}, state["enabled"]);
+
+        const auto it = engine.effects.find (uid);
+        auto* live = it != engine.effects.end() ? dynamic_cast<PluginEffect*> (it->second.get()) : nullptr;
+        fx->applyState (live != nullptr ? live->currentState() : state["state"].toString());
+
+        fx->prepare (rate, maxBlock);
+        created.push_back (fx.get());
+        return fx.get();
+    }
+
     AudioEngine& engine;
     double rate;
 };
 
 //==============================================================================
-AudioEngine::AudioEngine (juce::File settings)
-    : settingsFile (std::move (settings))
+AudioEngine::AudioEngine (juce::File settings, PluginHost& pluginHost)
+    : settingsFile (std::move (settings)), plugins (pluginHost)
 {
     mixSource = std::make_unique<MixSource> (*this);
     resampler = std::make_unique<juce::ResamplingAudioSource> (mixSource.get(), false, 2);
@@ -236,6 +330,10 @@ juce::var AudioEngine::handle (const juce::String& cmd, const juce::var& message
     if (cmd == "capture.start")     return startCapture (message);
     if (cmd == "capture.read")      return readCapture (message);
     if (cmd == "capture.stop")      return stopCapture();
+    if (cmd == "project.pluginInfo")        return pluginInfo (message);
+    if (cmd == "project.setPluginParam")    return setPluginParam (message);
+    if (cmd == "project.openPluginEditor")  return openPluginEditor (message);
+    if (cmd == "project.closePluginEditor") return closePluginEditor (message);
 
     throw CommandError ("Comando desconhecido: " + cmd);
 }
@@ -358,6 +456,48 @@ juce::var AudioEngine::syncProject (const juce::var& message)
     auto newGraph = MixGraph::build (message, rate, true, resources);
     resources.prune();
     publishGraph (std::move (newGraph));
+    lastProject = message;
+    return true;
+}
+
+// Um plugin mudou a latência: monta o grafo de novo para recalcular a compensação.
+void AudioEngine::rebuildGraph()
+{
+    if (lastProject.isObject())
+        syncProject (lastProject);
+}
+
+PluginEffect& AudioEngine::livePlugin (const juce::var& message)
+{
+    const auto uid = message["uid"].toString();
+    const auto it = effects.find (uid);
+    if (auto* fx = it != effects.end() ? dynamic_cast<PluginEffect*> (it->second.get()) : nullptr)
+        return *fx;
+
+    throw CommandError (failedPlugins.count (uid) ? "O plugin deste efeito não carregou."
+                                                  : "Plugin não encontrado no motor.");
+}
+
+juce::var AudioEngine::pluginInfo (const juce::var& message)
+{
+    return livePlugin (message).info();
+}
+
+juce::var AudioEngine::setPluginParam (const juce::var& message)
+{
+    livePlugin (message).setParameter (message["index"], static_cast<float> (message["value"]));
+    return true;
+}
+
+juce::var AudioEngine::openPluginEditor (const juce::var& message)
+{
+    livePlugin (message).openEditor();
+    return true;
+}
+
+juce::var AudioEngine::closePluginEditor (const juce::var& message)
+{
+    livePlugin (message).closeEditor();
     return true;
 }
 
@@ -467,13 +607,19 @@ juce::var AudioEngine::renderOffline (const juce::var& message)
     master.prepare (rate);
     offline->locate (start);
 
-    for (juce::int64 done = 0; done < frames;)
+    // Com plugins que atrasam o sinal, renderiza a mais e descarta o começo.
+    const auto latency = (juce::int64) offline->totalLatency;
+    for (juce::int64 done = 0; done < frames + latency;)
     {
-        const int n = (int) juce::jmin<juce::int64> (maxBlock, frames - done);
+        const int n = (int) juce::jmin<juce::int64> (maxBlock, frames + latency - done);
         block.clear();
         offline->render (block, n, start + done, start + frames, master);
-        for (int c = 0; c < 2; ++c)
-            result.copyFrom (c, (int) done, block, c, 0, n);
+
+        const auto from = juce::jmax<juce::int64> (done, latency);
+        const auto count = done + n - from;
+        if (count > 0)
+            for (int c = 0; c < 2; ++c)
+                result.copyFrom (c, (int) (from - latency), block, c, (int) (from - done), (int) count);
         done += n;
     }
 
@@ -683,15 +829,17 @@ void AudioEngine::renderProject (juce::AudioBuffer<float>& mix, int numSamples)
 
     if (playing.load() && audioGraph != nullptr && audioGraph->sampleRate == rate)
     {
+        // Continua depois do fim pelo tempo da latência dos plugins, para o final sair inteiro.
         auto pos = position.load();
         const auto end = playEnd.load();
-        const int n = (int) juce::jlimit<juce::int64> (0, numSamples, end - pos);
+        const auto stopAt = end + audioGraph->totalLatency;
+        const int n = (int) juce::jlimit<juce::int64> (0, numSamples, stopAt - pos);
         if (n > 0)
             audioGraph->render (mix, n, pos, end, masterState);
 
         pos += n;
         position.store (pos);
-        if (pos >= end)
+        if (pos >= stopAt)
         {
             playing.store (false);
             ended.store (true);
@@ -752,8 +900,9 @@ void AudioEngine::timerCallback()
 
     // A posição desconta a latência de saída: é o que está saindo no alto-falante agora.
     const double rate = projectRate.load();
+    const double graphLatency = graph != nullptr ? graph->totalLatency : 0;
     const auto heard = juce::jmax ((double) playStart.load(),
-                                   (double) position.load() - outputLatency.load() * rate);
+                                   (double) position.load() - outputLatency.load() * rate - graphLatency);
 
     juce::DynamicObject::Ptr tracks = new juce::DynamicObject();
     if (graph != nullptr)

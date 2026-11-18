@@ -309,7 +309,7 @@ nele em fases. A Fase 1 usa esse mesmo processo só para aplicar efeitos (Opçã
 | 0 ✅ | Projeto em modo Electron (`@quasar/app-vite` v3), `npm run dev:electron` e `npm run build:electron` funcionando | Web Audio (atual) | Concluída |
 | 1 ✅ | Executável JUCE (`raven-engine`) iniciado pelo Electron, que **lista plugins** VST3/LV2 instalados e **aplica efeito em trecho** (Opção C). Testada pela interface no modo dev e no app empacotado (seção 8) | Web Audio + motor JUCE só para aplicar efeito | Concluída |
 | 2 ✅ | **Motor nativo** de reprodução e mixagem (I/O nativo, grafo, transporte). O Web Audio sai do app desktop (seção 4.6) | Nativo | Concluída |
-| 3 | Plugins **em tempo real** nas cadeias de faixa e master, mais as janelas nativas dos plugins | Nativo | Médio |
+| 3 ✅ | Plugins **em tempo real** nas cadeias de faixa e master, mais as janelas nativas dos plugins (seção 4.7) | Nativo | Concluída |
 | 4 | Instrumentos virtuais (VSTi) nas faixas MIDI, MIDI I/O de hardware, gravação com compensação de latência | Nativo | Médio |
 | 5 | Recursos de DAW: automação, clips, envios/barramentos, congelar faixa, render em segundo plano | Nativo | Médio |
 
@@ -318,7 +318,7 @@ flowchart LR
   F0["Fase 0 ✅<br/>Electron<br/>build e instalador"]
   F1["Fase 1 ✅<br/>Motor JUCE<br/>varredura + aplicar efeito"]
   F2["Fase 2 ✅<br/>Motor nativo<br/>I/O, grafo, transporte"]
-  F3["Fase 3<br/>Plugins em tempo real<br/>janelas nativas"]
+  F3["Fase 3 ✅<br/>Plugins em tempo real<br/>janelas nativas"]
   F4["Fase 4<br/>VSTi, MIDI de hardware,<br/>latência de gravação"]
   F5["Fase 5<br/>DAW: automação, clips,<br/>barramentos, congelar"]
   F0 --> F1 --> F2 --> F3 --> F4 --> F5
@@ -673,10 +673,70 @@ Diferenças conhecidas, todas herdadas do navegador ou intencionais:
 **O que fica para depois:**
 
 - O áudio ainda mora na memória da interface (sem paginação em disco).
-- Plugins VST3/LV2 nas cadeias em tempo real: Fase 3.
 - Faixas com instrumentos virtuais e MIDI de hardware: Fase 4.
 
-### 4.7 Ambiente de desenvolvimento (Windows)
+### 4.7 Fase 3: plugins nas cadeias em tempo real (como está implementado)
+
+Um slot de plugin VST3/LV2 entra na mesma cadeia dos efeitos embutidos, da faixa
+ou do master: **Efeitos em tempo real → Adicionar efeito → Plugin (VST3 / LV2)…**.
+O plugin processa ao tocar e ao exportar, sem alterar o áudio da faixa, e pode
+ser ligado/desligado, reordenado e removido como qualquer efeito.
+
+**No projeto**, um slot de plugin é
+`{ uid, type: 'plugin', enabled, plugin: { id, name, vendor, format }, state, stateVersion }`.
+`state` é o estado do plugin (`getStateInformation`) em base64 (`null` = de
+fábrica) e vai para o arquivo `.ravenproj`. No navegador, o slot passa o som sem
+efeito (o motor Web Audio ignora `type: 'plugin'`).
+
+**No motor:** `engine/src/PluginEffect.cpp` é um `RealtimeEffect` que embrulha a
+instância do plugin.
+
+- O thread de áudio nunca espera: usa *try-lock* no lock do plugin e, se ele
+  estiver ocupado (trocando de estado), o som passa sem efeito naquele bloco.
+- Plugin só mono numa cadeia estéreo recebe (L + R) / 2 e devolve nos dois canais.
+- **Estado e histórico:** mexer no plugin (janela nativa ou parâmetros genéricos)
+  dispara `chain.pluginState` depois de 400 ms sem mudanças; a interface grava o
+  estado no efeito com "Plugin ajustado: <nome>" (ajustes seguidos viram um passo
+  só). Desfazer/refazer manda o estado daquele passo, e o motor o aplica com
+  `setStateInformation`. As notificações geradas pelo próprio
+  `setStateInformation` não viram ajustes novos (o motor compara com o estado
+  que acabou de aplicar).
+- O estado só viaja quando muda (`stateVersion`, como as notas MIDI), porque pode
+  ter centenas de KB.
+- **Render offline:** instância nova do plugin, com o estado da instância ao vivo
+  (pega ajustes feitos há menos de 400 ms).
+- **Compensação de latência (PDC):** cada faixa é atrasada até a faixa mais lenta
+  (até 1 s), a reprodução continua depois do fim pelo tempo da latência total, a
+  posição mostrada desconta essa latência e o render offline descarta o começo.
+  Se um plugin mudar a latência, o motor remonta o grafo.
+- **Plugin ausente** (outra máquina, desinstalado): o motor avisa
+  (`chain.pluginError`, notificação na interface), o slot passa o som e o estado
+  fica guardado no projeto.
+- **Janela nativa:** botão "Interface" no cartão do slot. A janela fecha sozinha
+  se o slot for removido.
+
+**Comandos novos:** `project.pluginInfo`, `project.setPluginParam`,
+`project.openPluginEditor`, `project.closePluginEditor`. Eventos:
+`chain.pluginState`, `chain.paramChanged`, `chain.editorClosed`, `chain.pluginError`.
+
+**Na interface:** `PluginPickerDialog.vue` (escolher o plugin),
+`PluginSlotBody.vue` (corpo do cartão: janela, latência, parâmetros) e
+`PluginParamList.vue` (controles genéricos, também usados em Efeito → Plugin…).
+Com o transporte parado o motor também recebe o projeto (`syncEngine`), para os
+plugins ficarem carregados e a janela abrir sem precisar tocar.
+
+**Testado** (18/11/2026):
+
+| Teste | Resultado |
+|---|---|
+| kHs Gain na cadeia, Gain a 20% | −18,00 dB no render offline, −18,04 dB pela interface |
+| Desfazer / refazer o ajuste | +0,00 dB → −18,05 dB, sem ajustes fantasmas no histórico |
+| Desligar o plugin tocando | nível sobe +18 dB na hora, a posição segue contínua |
+| PDC: mesmo ruído em duas faixas, uma com MFreeformPhase (8192 amostras) | soma +6,02 dB (alinhadas; desalinhadas dariam ~+3 dB) |
+| Projeto salvo e reaberto | plugin e estado idênticos |
+| Plugin ausente | aviso e som passando sem efeito |
+
+### 4.8 Ambiente de desenvolvimento (Windows)
 
 | Ferramenta | Para quê |
 |---|---|
@@ -819,7 +879,7 @@ um addon do Node.
    mostrava 2083 parâmetros (2080 eram controladores MIDI internos do VST3).
 
    Para compilar numa máquina nova:
-   1. instalar o ambiente da [seção 4.7](#47-ambiente-de-desenvolvimento-windows);
+   1. instalar o ambiente da [seção 4.8](#48-ambiente-de-desenvolvimento-windows);
    2. depois de clonar o repositório: `git submodule update --init`;
    3. `npm run build:engine` (gera `engine/bin/raven-engine.exe`);
    4. teste rápido sem interface, no Git Bash:

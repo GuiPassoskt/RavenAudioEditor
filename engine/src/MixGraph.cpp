@@ -34,6 +34,9 @@ void TrackState::prepare (double rate, int maxBlockSize)
     gainL.prepare (rate, gainSmoothing);
     gainR.prepare (rate, gainSmoothing);
     snapGains = true;
+    delayLine.setSize (2, (int) rate + 1);
+    delayLine.clear();
+    delayIndex = 0;
 }
 
 //==============================================================================
@@ -80,6 +83,21 @@ MixGraph::Ptr MixGraph::build (const juce::var& project, double rate, bool apply
         }
     }
 
+    // Compensação de latência: todas as faixas saem atrasadas como a mais lenta.
+    const auto chainLatency = [] (const std::vector<RealtimeEffect::Ptr>& chain)
+    {
+        int latency = 0;
+        for (const auto& fx : chain)
+            latency += juce::jmax (0, fx->getLatencySamples());
+        return latency;
+    };
+
+    int slowest = 0;
+    for (const auto& t : graph->tracks)
+        slowest = juce::jmax (slowest, chainLatency (t.effects));
+    for (auto& t : graph->tracks)
+        t.compensation = juce::jmin (slowest - chainLatency (t.effects), t.state->delayLine.getNumSamples() - 1);
+
     if (applyMaster)
     {
         const auto& master = project["master"];
@@ -90,6 +108,7 @@ MixGraph::Ptr MixGraph::build (const juce::var& project, double rate, bool apply
                     graph->masterEffects.push_back (e);
     }
 
+    graph->totalLatency = slowest + chainLatency (graph->masterEffects);
     return graph;
 }
 
@@ -100,6 +119,8 @@ void MixGraph::locate (juce::int64)
         t.state->synth.allNotesOff();
         t.state->startFromHere = true;
         t.state->snapGains = true;
+        t.state->delayLine.clear();
+        t.state->delayIndex = 0;
         for (auto& fx : t.effects)
             fx->reset();
     }
@@ -179,6 +200,25 @@ void MixGraph::render (juce::AudioBuffer<float>& out, int numSamples, juce::int6
 
         for (auto& fx : t.effects)
             fx->process (buf, numSamples);
+
+        if (t.compensation > 0)
+        {
+            auto& line = st.delayLine;
+            const int size = line.getNumSamples();
+            for (int c = 0; c < 2; ++c)
+            {
+                auto* d = line.getWritePointer (c);
+                auto* x = buf.getWritePointer (c);
+                int w = st.delayIndex;
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    d[w] = x[i];
+                    x[i] = d[(w - t.compensation + size) % size];
+                    w = (w + 1) % size;
+                }
+            }
+            st.delayIndex = (st.delayIndex + numSamples) % size;
+        }
 
         st.gainL.target = t.gainL;
         st.gainR.target = t.gainR;

@@ -69,5 +69,20 @@ export async function connect (port = 9333) {
     }
     throw new Error(`timeout esperando: ${expr}`)
   }
-  return { send, evaluate, sleep, findByText, clickAt, clickText, key, type, shot, waitFor, close: () => ws.close() }
+  // Abre um menu da barra e clica num item; tenta de novo se o clique se perder
+  // (animações de diálogos que acabaram de fechar engolem o primeiro clique).
+  const menu = async (menuLabel, itemLabel) => {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await clickText(menuLabel, '.menu-bar .q-btn')
+      await sleep(400)
+      if (await findByText(itemLabel, '.q-menu .q-item')) {
+        await clickText(itemLabel, '.q-menu .q-item')
+        return
+      }
+      await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 })
+      await sleep(500)
+    }
+    throw new Error(`não consegui abrir ${menuLabel} → ${itemLabel}`)
+  }
+  return { send, evaluate, sleep, findByText, clickAt, clickText, key, type, shot, waitFor, menu, close: () => ws.close() }
 }

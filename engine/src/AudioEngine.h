@@ -10,6 +10,8 @@
 // taxa do mixer do sistema.
 
 #include "MixGraph.h"
+#include "PluginEffect.h"
+#include "PluginHost.h"
 
 #include <juce_audio_devices/juce_audio_devices.h>
 
@@ -22,7 +24,7 @@ class AudioEngine final : private juce::AudioIODeviceCallback,
                           private juce::Timer
 {
 public:
-    explicit AudioEngine (juce::File settingsFile);
+    AudioEngine (juce::File settingsFile, PluginHost& plugins);
     ~AudioEngine() override;
 
     // Comandos audio.*, project.*, clips.*, transport.*, preview.*, synth.*, render.*, capture.*.
@@ -52,6 +54,13 @@ private:
     juce::var startCapture (const juce::var& message);
     juce::var readCapture (const juce::var& message);
     juce::var stopCapture();
+    juce::var pluginInfo (const juce::var& message);
+    juce::var setPluginParam (const juce::var& message);
+    juce::var openPluginEditor (const juce::var& message);
+    juce::var closePluginEditor (const juce::var& message);
+
+    PluginEffect& livePlugin (const juce::var& message);
+    void rebuildGraph();
 
     void setProjectRate (double rate);
     void publishGraph (MixGraph::Ptr newGraph);
@@ -70,6 +79,7 @@ private:
     void timerCallback() override;
 
     juce::File settingsFile;
+    PluginHost& plugins;
     juce::AudioDeviceManager deviceManager;
     juce::String deviceError;
     std::unique_ptr<MixSource> mixSource;
@@ -84,6 +94,8 @@ private:
     std::map<juce::String, TrackState::Ptr> trackStates;
     std::map<juce::String, RealtimeEffect::Ptr> effects;
     std::map<juce::String, std::pair<juce::String, NoteList::Ptr>> notesCache;  // trackId -> (versão, notas)
+    std::map<juce::String, juce::String> failedPlugins;  // uid -> pluginId que não carregou (não tenta de novo)
+    juce::var lastProject;                               // último project.sync (para remontar o grafo)
     std::vector<juce::ReferenceCountedObjectPtr<juce::ReferenceCountedObject>> releasePool;
 
     // Grafo atual: o thread de mensagens troca, o de áudio copia com try-lock.

@@ -22,9 +22,12 @@ public:
     // Executa um comando do protocolo (Protocol.h). Lança CommandError em erros esperados.
     juce::var handle (const juce::String& cmd, const juce::var& message);
 
+    // Instancia um plugin da lista (thread de mensagens). nullptr e error preenchido se falhar.
+    std::unique_ptr<juce::AudioPluginInstance> createPlugin (const juce::String& pluginId, double sampleRate,
+                                                             int maxBlockSize, juce::String& error);
+
 private:
     class Instance;
-    class PluginWindow;
 
     juce::var ping() const;
     juce::var listPlugins();
@@ -48,5 +51,12 @@ private:
 
     JUCE_DECLARE_NON_COPYABLE (PluginHost)
 };
+
+// Parâmetros de um plugin para a interface (só os automatizáveis).
+juce::var describeParameter (const juce::AudioProcessorParameter& param);
+juce::var describeParameters (juce::AudioPluginInstance& plugin);
+
+// Tenta fazer o barramento principal do plugin ter numChannels de entrada e de saída.
+bool configureLayout (juce::AudioPluginInstance& plugin, int numChannels);
 
 } // namespace raven

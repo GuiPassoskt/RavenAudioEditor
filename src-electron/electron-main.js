@@ -15,7 +15,8 @@ const platform = process.platform || os.platform()
 const ENGINE_COMMANDS = new Set([
   'ping', 'plugins.list', 'fx.create', 'fx.setParam', 'fx.openEditor', 'fx.closeEditor', 'fx.destroy',
   'audio.status', 'audio.devices', 'audio.setDevice', 'project.sync', 'project.setRate', 'clips.release',
-  'transport.play', 'transport.stop', 'preview.stop', 'synth.audition', 'capture.start', 'capture.stop'
+  'transport.play', 'transport.stop', 'preview.stop', 'synth.audition', 'capture.start', 'capture.stop',
+  'project.pluginInfo', 'project.setPluginParam', 'project.openPluginEditor', 'project.closePluginEditor'
 ])
 const ENGINE_SEND_AUDIO = new Set(['clips.load', 'preview.play'])
 const ENGINE_RECEIVE_AUDIO = new Set(['render.offline', 'capture.read'])

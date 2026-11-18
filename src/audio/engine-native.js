@@ -15,7 +15,6 @@ const bridge = typeof window !== 'undefined' ? window.audio : undefined
 const METERS_STALE_MS = 200 // sem medidores recentes, os níveis caem a zero
 const CAPTURE_POLL_MS = 100 // a gravação é lida do motor a cada 100 ms
 
-const fxJson = fx => ({ uid: String(fx.uid), type: fx.type, enabled: fx.enabled, params: { ...fx.params } })
 const isAudio = t => t.kind !== 'midi'
 const request = (cmd, args) => call(() => bridge.request(cmd, args))
 
@@ -39,6 +38,7 @@ export class NativeAudioEngine {
   #uploaded = new Set() // clipes que o motor tem
   #uploading = new Map() // id -> Promise
   #notesSent = new Map() // id da faixa -> notesKey enviado
+  #statesSent = new Map() // uid do plugin -> stateVersion que o motor já tem
 
   constructor () {
     bridge.onEvent((name, msg) => this.#onEvent(name, msg))
@@ -54,6 +54,7 @@ export class NativeAudioEngine {
       // Motor (re)iniciado: perdeu clipes, notas e reprodução.
       this.#uploaded.clear()
       this.#notesSent.clear()
+      this.#statesSent.clear()
       this.#ended = true
     }
   }
@@ -84,9 +85,28 @@ export class NativeAudioEngine {
     return Promise.all(tracks.filter(t => isAudio(t) && t.channels[0]?.length).map(t => this.#ensureClip(t.channels)))
   }
 
+  // Efeito no formato do motor. Plugins: o estado (que pode ter centenas de KB)
+  // só vai quando a versão muda, exceto no render offline (all).
+  #fxJson (fx, all) {
+    const uid = String(fx.uid)
+    if (fx.type !== 'plugin') return { uid, type: fx.type, enabled: fx.enabled, params: { ...fx.params } }
+    const json = { uid, type: 'plugin', enabled: fx.enabled, pluginId: fx.plugin.id, stateVersion: fx.stateVersion }
+    if (all || this.#statesSent.get(uid) !== fx.stateVersion) {
+      json.state = fx.state ?? ''
+      if (!all) this.#statesSent.set(uid, fx.stateVersion)
+    }
+    return json
+  }
+
+  // O estado veio do próprio motor (chain.pluginState): não precisa voltar para ele.
+  markPluginStateSent (uid, stateVersion) {
+    this.#statesSent.set(String(uid), stateVersion)
+  }
+
   // Projeto no formato de MixGraph::build. As notas só vão quando mudam
   // (notesKey = versão da faixa), exceto no render offline (allNotes).
   #projectJson (tracks, master, rate, allNotes = false) {
+    const fxJson = fx => this.#fxJson(fx, allNotes)
     return {
       rate,
       master: { gain: master.gain, effects: master.effects.map(fxJson) },
@@ -138,6 +158,11 @@ export class NativeAudioEngine {
     this.#ended = false
     this.#meters = null
     this.#startedAt = performance.now()
+  }
+
+  // Projeto atualizado no motor com o transporte parado (plugins das cadeias).
+  syncIdle (tracks, master, rate) {
+    return this.#sync(tracks, master, rate).catch(e => console.error('[motor nativo]', e))
   }
 
   // O motor nativo troca o grafo sem parar: nunca precisa reiniciar a reprodução.
@@ -259,3 +284,12 @@ export async function createNativeEngine () {
 // entradas, taxas e tamanhos de buffer, e a troca do dispositivo (salva entre sessões).
 export const audioDevices = () => request('audio.devices')
 export const setAudioDevice = settings => request('audio.setDevice', settings)
+
+// Plugins nas cadeias em tempo real (Fase 3): informações, parâmetros e janela
+// nativa de um slot, pelo uid do efeito.
+export const chainPlugin = {
+  info: uid => request('project.pluginInfo', { uid: String(uid) }),
+  setParam: (uid, index, value) => request('project.setPluginParam', { uid: String(uid), index, value }),
+  openEditor: uid => request('project.openPluginEditor', { uid: String(uid) }),
+  closeEditor: uid => request('project.closePluginEditor', { uid: String(uid) })
+}

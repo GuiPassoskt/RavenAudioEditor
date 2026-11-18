@@ -56,6 +56,10 @@ struct TrackState : public juce::ReferenceCountedObject
     bool startFromHere = false;  // início da reprodução: notas já soando também tocam
 
     std::atomic<float> peakL { 0 }, peakR { 0 };  // medidores (pico desde a última leitura)
+
+    // Compensação de latência (PDC): atraso desta faixa para alinhar com a mais lenta.
+    juce::AudioBuffer<float> delayLine;  // até 1 s
+    int delayIndex = 0;
 };
 
 // Fader do master (o estado suavizado sobrevive às trocas de grafo).
@@ -82,6 +86,7 @@ public:
         int program = 0;
         bool drum = false;
         std::vector<RealtimeEffect::Ptr> effects;
+        int compensation = 0;  // amostras de atraso para alinhar com a faixa mais lenta
     };
 
     // De onde vêm os objetos que o grafo usa: ao vivo, o motor reaproveita os que
@@ -111,6 +116,10 @@ public:
     std::vector<Track> tracks;
     std::vector<RealtimeEffect::Ptr> masterEffects;
     float masterGain = 1;
+
+    // Atraso total da saída em relação ao transporte (faixa mais lenta + master),
+    // em amostras: a reprodução e o render descontam isso.
+    int totalLatency = 0;
 
 private:
     void scheduleNotes (Track& t, int numSamples, juce::int64 position, juce::int64 end);

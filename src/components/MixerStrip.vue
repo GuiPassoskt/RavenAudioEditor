@@ -63,7 +63,7 @@
 import { computed, reactive, watch } from 'vue'
 import { useProjectStore } from 'src/stores/project'
 import { useUiStore } from 'src/stores/ui'
-import { realtimeDef } from 'src/audio/realtime'
+import { effectName } from 'src/audio/realtime'
 import { rgba, textOn } from 'src/audio/colors'
 
 const props = defineProps({
@@ -95,7 +95,7 @@ const panLabel = computed(() => {
   return `${p < 0 ? 'E' : 'D'} ${Math.round(Math.abs(p) * 100)}`
 })
 
-const fxName = fx => realtimeDef(fx.type)?.name ?? fx.type
+const fxName = effectName
 const faderPct = d => (d - GAIN_MIN) / (GAIN_MAX - GAIN_MIN) * 100
 const meterPct = v => (v > 0 ? Math.max(0, Math.min(100, (20 * Math.log10(v) - METER_MIN_DB) / -METER_MIN_DB * 100)) : 0)
 

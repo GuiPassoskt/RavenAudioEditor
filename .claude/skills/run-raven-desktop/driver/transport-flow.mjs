@@ -27,18 +27,16 @@ const check = (ok, label, detail = '') => {
 try {
   await c.waitFor(`!!document.querySelector('.menu-bar')`, 60000)
   await c.sleep(1500)
-  await c.evaluate(`Object.assign(${store('ui')}, { splashOpen: false, pluginEffect: false, effect: null, audioDevicesOpen: false, aboutOpen: false })`)
+  await c.evaluate(`Object.assign(${store('ui')}, { splashOpen: false, pluginEffect: false, effect: null, audioDevicesOpen: false, aboutOpen: false, fxTarget: null })`)
   await c.evaluate(`${P}.stop(); ${P}.resetProject()`)
-  await c.sleep(500)
+  await c.sleep(1200) // a tela de abertura some com animação e engole cliques
 
   const kind = await c.evaluate(`import('/src/audio/engine.js').then(m => m.engineReady)`).catch(() => null)
   check(kind === 'native', 'motor de áudio nativo em uso', String(kind))
 
   // Faixa estéreo com tom de 5 s a −24 dB.
-  await c.clickText('Faixas', '.menu-bar .q-btn'); await c.sleep(400)
-  await c.clickText('Nova faixa estéreo', '.q-menu .q-item'); await c.sleep(600)
-  await c.clickText('Gerar', '.menu-bar .q-btn'); await c.sleep(400)
-  await c.clickText('Tom', '.q-menu .q-item'); await c.sleep(700)
+  await c.menu('Faixas', 'Nova faixa estéreo'); await c.sleep(600)
+  await c.menu('Gerar', 'Tom'); await c.sleep(700)
   await c.clickText('Aplicar', '.effect-card button'); await c.sleep(1200)
   await c.evaluate(`${P}.setTrackProp(${P}.tracks[0].id, 'gain', -24); ${P}.selectNone(); ${P}.cursorTo(0)`)
 
@@ -93,8 +91,7 @@ try {
   check(!notes.length, 'sem mensagens de erro', notes.join(' | '))
 
   // Diálogo de dispositivos.
-  await c.clickText('Transporte', '.menu-bar .q-btn'); await c.sleep(400)
-  await c.clickText('Dispositivos de áudio', '.q-menu .q-item')
+  await c.menu('Transporte', 'Dispositivos de áudio')
   await c.waitFor(`!!document.querySelector('.devices-card .q-select')`, 15000)
   const dialog = await c.evaluate(`document.querySelector('.devices-card').innerText`)
   check(/Em uso: .+ Hz/.test(dialog), 'diálogo de dispositivos', dialog.split(String.fromCharCode(10))[2])

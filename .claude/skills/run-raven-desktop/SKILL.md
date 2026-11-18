@@ -1,6 +1,6 @@
 ---
 name: run-raven-desktop
-description: Abre e controla o app desktop do Raven Audio Editor (Electron + motor JUCE raven-engine) para testar de verdade a reprodução, a mixagem, os efeitos em tempo real, a gravação e os dispositivos de áudio do motor nativo, o fluxo Efeito → Plugin (VST3 / LV2)… e a tela Sobre. Use para rodar, testar, tirar prints ou confirmar uma mudança no app desktop, no motor (engine/), no motor de áudio nativo ou no diálogo de plugins.
+description: Abre e controla o app desktop do Raven Audio Editor (Electron + motor JUCE raven-engine) para testar de verdade a reprodução, a mixagem, os efeitos em tempo real, a gravação e os dispositivos de áudio do motor nativo, plugins VST3/LV2 nas cadeias em tempo real (estado, desfazer, janela nativa, compensação de latência), o fluxo Efeito → Plugin (VST3 / LV2)… e a tela Sobre. Use para rodar, testar, tirar prints ou confirmar uma mudança no app desktop, no motor (engine/), no motor de áudio nativo ou no diálogo de plugins.
 ---
 
 # Rodar e testar o Raven Audio Editor desktop
@@ -10,11 +10,17 @@ O app é controlado pelo protocolo de depuração do Chromium (CDP), com o
 `WebSocket` nativo do Node. Não precisa de Playwright.
 
 Arquivos desta skill:
-- `driver/cdplib.mjs`: clicar, teclar, avaliar JS na página, tirar print.
+- `driver/cdplib.mjs`: clicar, teclar, abrir menus (`c.menu('Faixas', 'Nova faixa estéreo')`,
+  com nova tentativa se o clique se perder), avaliar JS na página, tirar print.
 - `driver/plugin-flow.mjs`: Efeito → Plugin pela interface, com 9 verificações (Fase 1).
 - `driver/transport-flow.mjs`: tocar, mix ao vivo, fim do trecho, gravar com R e
   dispositivos de áudio pela interface, com 8 verificações (Fase 2). Toca um tom baixo.
+- `driver/chain-flow.mjs`: plugin numa cadeia em tempo real pela interface (painel →
+  Plugin…, parâmetro genérico, histórico, desfazer/refazer, liga/desliga tocando, janela,
+  arquivo de projeto), com 8 verificações (Fase 3).
 - `driver/engine-smoke.mjs`: plugins no motor sozinho (ping, lista, processamento).
+- `driver/engine-chain.mjs`: plugin em cadeia no motor sozinho (estado, desfazer sem eco,
+  render com o estado ao vivo, PDC, janela, plugin ausente), com 11 verificações.
 - `driver/engine-audio.mjs`: motor de áudio sozinho: ganho/pan exatos, os 8 efeitos,
   MIDI, e com `--live` reprodução e gravação (25 verificações).
 
@@ -28,6 +34,9 @@ Arquivos desta skill:
    3.31 que vem no Build Tools). **Dev-C++/MinGW não serve.**
 4. Plugin **kHs Gain** instalado (Kilohearts Essentials, gratuito). Os cenários
    usam ele porque o resultado é calculável: Gain a 20% do slider dá −18 dB.
+5. Para o teste de compensação de latência: **MFreeformPhase** (MeldaProduction
+   Free Bundle), com 8192 amostras de latência e fase plana por padrão. Sem ele,
+   o `engine-chain.mjs` pula esse teste.
 
 ## Armadilhas (leia antes)
 
@@ -51,6 +60,11 @@ Arquivos desta skill:
 - **Entrada padrão** é a do Windows; nesta máquina é o "CABLE Output (VB-Audio
   Virtual Cable)", que grava silêncio. Para testar som de verdade, escolha o
   microfone em Transporte → Dispositivos de áudio… (ou `audio.setDevice` com `input`).
+- **Comando novo do motor dá "Comando do motor não permitido"**: o processo main
+  só aceita uma lista fechada (`ENGINE_COMMANDS` em `src-electron/electron-main.js`).
+  Mudar o main reinicia o Electron no `quasar dev`; reabra o app (ver "Encerrar").
+- **Tela de abertura e diálogos somem com animação** e engolem o primeiro clique:
+  use `c.menu(...)` e espere ~1 s depois de fechá-los.
 - **Campo `id` no protocolo**: o `id` de cada pedido sobrescreve campos de mesmo
   nome; por isso clipes usam `clipId`.
 - **Modo dev**: o DevTools abre encaixado (a página fica com ~725 px) e também
@@ -74,6 +88,7 @@ APP="dist/electron/Packaged/Raven Audio Editor-win32-x64/raven-audio-editor.exe"
 for i in $(seq 1 20); do sleep 1; curl -s http://127.0.0.1:9333/json | grep -q index.html && break; done
 node .claude/skills/run-raven-desktop/driver/plugin-flow.mjs ./raven-prints 9333
 node .claude/skills/run-raven-desktop/driver/transport-flow.mjs ./raven-prints 9333
+node .claude/skills/run-raven-desktop/driver/chain-flow.mjs ./raven-prints 9333
 ```
 
 ## Caminho B: modo dev (testa o motor em `engine/bin/`)
@@ -118,6 +133,7 @@ echo '{"id":1,"cmd":"ping"}' | engine/bin/raven-engine.exe           # responde 
 engine/bin/raven-engine.exe --scan > "$D/scan.log"                    # termina com {"event":"scan.done","count":N}
 node .claude/skills/run-raven-desktop/driver/engine-smoke.mjs "$(cygpath -w engine/bin/raven-engine.exe)" "$(cygpath -w "$D")"
 node .claude/skills/run-raven-desktop/driver/engine-audio.mjs "$(cygpath -w engine/bin/raven-engine.exe)" "$(cygpath -w "$D")" --live
+node .claude/skills/run-raven-desktop/driver/engine-chain.mjs "$(cygpath -w engine/bin/raven-engine.exe)" "$(cygpath -w "$D")"
 ```
 
 O `engine-smoke.mjs` exige RMS a −18 dB com erro < 0,001 (dá 0,0445 exato).

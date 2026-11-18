@@ -34,8 +34,13 @@
 </template>
 
 <script setup>
+import { onBeforeUnmount } from 'vue'
+import { Notify } from 'quasar'
 import { useUiStore } from 'src/stores/ui'
-import { hasNativeEngine } from 'src/audio/plugins'
+import { useProjectStore } from 'src/stores/project'
+import { hasNativeEngine, nativePlugins } from 'src/audio/plugins'
+import { engine } from 'src/audio/engine'
+import { effectName } from 'src/audio/realtime'
 import MenuBar from 'components/MenuBar.vue'
 import MainToolbar from 'components/MainToolbar.vue'
 import SelectionBar from 'components/SelectionBar.vue'
@@ -49,6 +54,20 @@ import RealtimeEffectsPanel from 'components/RealtimeEffectsPanel.vue'
 import SplashDialog from 'components/SplashDialog.vue'
 
 const ui = useUiStore()
+const store = useProjectStore()
+
+// Plugins nas cadeias em tempo real (Fase 3): o motor avisa quando o usuário mexe
+// no plugin (o ajuste entra no histórico) e quando um plugin não carrega.
+const offEngineEvents = nativePlugins.onEvent((name, msg) => {
+  if (name === 'chain.pluginState') {
+    const version = store.setPluginStateByUid(msg.uid, msg.state)
+    if (version !== null) engine.markPluginStateSent?.(msg.uid, version)
+  } else if (name === 'chain.pluginError') {
+    const fx = [store.master, ...store.tracks].flatMap(t => t.effects ?? []).find(e => String(e.uid) === String(msg.uid))
+    Notify.create({ type: 'warning', message: `${fx ? effectName(fx) : 'Plugin'}: ${msg.message} O som passa sem este efeito.`, position: 'bottom', timeout: 5000 })
+  }
+})
+onBeforeUnmount(offEngineEvents)
 </script>
 
 <style scoped>

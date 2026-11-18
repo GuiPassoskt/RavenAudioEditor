@@ -258,8 +258,12 @@ export const REALTIME_EFFECTS = [
 export const realtimeDef = id => REALTIME_EFFECTS.find(d => d.id === id)
 
 export function realtimeDefaults (id) {
-  return Object.fromEntries(realtimeDef(id).params.map(p => [p.key, p.default]))
+  return Object.fromEntries((realtimeDef(id)?.params ?? []).map(p => [p.key, p.default]))
 }
+
+// Nome para exibir: efeito embutido ou plugin VST3/LV2 (type 'plugin', Fase 3).
+// No navegador, um slot de plugin passa o som sem efeito (buildChain o ignora).
+export const effectName = fx => (fx.type === 'plugin' ? fx.plugin?.name : realtimeDef(fx.type)?.name) ?? fx.type
 
 // Monta a cadeia. Cada efeito ganha um "bypass" com crossfade (wet/dry), de modo
 // que ligar e desligar não interrompe a reprodução — o equivalente a

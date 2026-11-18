@@ -41,6 +41,10 @@ export function encodeWav (channels, rate, format = 'pcm16') {
 
 const MAGIC = 'REAP' // assinatura mantida para abrir projetos antigos
 
+// Efeito em tempo real no arquivo: embutido (parâmetros) ou plugin (identificação e estado).
+const effectJson = ({ type, params, enabled, plugin, state }) =>
+  type === 'plugin' ? { type, enabled, plugin, state } : { type, params, enabled }
+
 export function encodeProject (project) {
   const header = {
     version: 1,
@@ -51,17 +55,17 @@ export function encodeProject (project) {
       ? {
           kind: 'midi', name: t.name, color: t.color, offset: t.offset, gain: t.gain, pan: t.pan, mute: t.mute, solo: t.solo,
           program: t.program, drum: t.drum, channels: 0, length: 0,
-          effects: (t.effects ?? []).map(({ type, params, enabled }) => ({ type, params, enabled })),
+          effects: (t.effects ?? []).map(effectJson),
           notes: t.notes.map(({ pitch, start, dur, vel }) => ({ pitch, start, dur, vel }))
         }
       : {
           name: t.name, color: t.color, offset: t.offset, gain: t.gain, pan: t.pan, mute: t.mute, solo: t.solo,
-          effects: (t.effects ?? []).map(({ type, params, enabled }) => ({ type, params, enabled })),
+          effects: (t.effects ?? []).map(effectJson),
           channels: t.channels.length, length: t.channels[0].length
         }),
     master: {
       gain: project.master?.gain ?? 0,
-      effects: (project.master?.effects ?? []).map(({ type, params, enabled }) => ({ type, params, enabled }))
+      effects: (project.master?.effects ?? []).map(effectJson)
     }
   }
   const json = new TextEncoder().encode(JSON.stringify(header))

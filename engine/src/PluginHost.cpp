@@ -1,5 +1,6 @@
 #include "PluginHost.h"
 
+#include "PluginWindow.h"
 #include "Protocol.h"
 
 #include <limits>
@@ -9,38 +10,6 @@ namespace raven
 
 static constexpr int blockSize = 512;
 static constexpr int maxTextLength = 64;
-
-//==============================================================================
-// Janela nativa do plugin, aberta pelo motor fora do Electron (seção 5 do documento).
-// Plugins sem interface própria ganham a tela genérica do JUCE.
-class PluginHost::PluginWindow final : public juce::DocumentWindow
-{
-public:
-    PluginWindow (juce::AudioPluginInstance& plugin, std::function<void()> onCloseIn)
-        : DocumentWindow (plugin.getName(), juce::Colour (0xff1e1f22), DocumentWindow::closeButton),
-          onClose (std::move (onCloseIn))
-    {
-        setUsingNativeTitleBar (true);
-
-        juce::AudioProcessorEditor* editor = plugin.hasEditor() ? plugin.createEditorAndMakeActive() : nullptr;
-        if (editor == nullptr)
-            editor = new juce::GenericAudioProcessorEditor (plugin);
-
-        setContentOwned (editor, true);
-        setResizable (editor->isResizable(), false);
-
-        // Fica acima da janela do Electron, como as janelas de plugin das DAWs.
-        setAlwaysOnTop (true);
-        centreWithSize (getWidth(), getHeight());
-        setVisible (true);
-        toFront (true);
-    }
-
-    void closeButtonPressed() override { onClose(); }
-
-private:
-    std::function<void()> onClose;
-};
 
 //==============================================================================
 class PluginHost::Instance final : private juce::AudioProcessorListener
@@ -91,7 +60,7 @@ static juce::var describePlugin (const juce::PluginDescription& d)
                                 { "file", d.fileOrIdentifier } }).get());
 }
 
-static juce::var describeParameter (const juce::AudioProcessorParameter& param)
+juce::var describeParameter (const juce::AudioProcessorParameter& param)
 {
     const auto value = param.getValue();
 
@@ -124,8 +93,18 @@ static juce::var describeParameter (const juce::AudioProcessorParameter& param)
                                 { "text", param.getText (value, maxTextLength) } }).get());
 }
 
-// Tenta fazer o barramento principal do plugin ter numChannels de entrada e de saída.
-static bool configureLayout (juce::AudioPluginInstance& plugin, int numChannels)
+juce::var describeParameters (juce::AudioPluginInstance& plugin)
+{
+    // Parâmetros não automatizáveis ficam de fora: em VST3 costumam ser os
+    // milhares de controladores MIDI internos ("MIDI CC 0"…), não ajustes do som.
+    juce::Array<juce::var> params;
+    for (auto* param : plugin.getParameters())
+        if (param->isAutomatable())
+            params.add (describeParameter (*param));
+    return params;
+}
+
+bool configureLayout (juce::AudioPluginInstance& plugin, int numChannels)
 {
     auto layout = plugin.getBusesLayout();
     if (layout.inputBuses.isEmpty() || layout.outputBuses.isEmpty())
@@ -254,6 +233,24 @@ void PluginHost::reloadKnownPlugins()
         knownPlugins.recreateFromXml (*xml);
 }
 
+std::unique_ptr<juce::AudioPluginInstance> PluginHost::createPlugin (const juce::String& pluginId, double sampleRate,
+                                                                    int maxBlockSize, juce::String& error)
+{
+    reloadKnownPlugins();
+    const auto description = knownPlugins.getTypeForIdentifierString (pluginId);
+    if (description == nullptr)
+    {
+        error = "Plugin não encontrado. Procure os plugins instalados de novo.";
+        return nullptr;
+    }
+
+    juce::String loadError;
+    auto plugin = formatManager.createPluginInstance (*description, sampleRate, maxBlockSize, loadError);
+    if (plugin == nullptr)
+        error = "Não foi possível carregar \"" + description->name + "\": " + loadError;
+    return plugin;
+}
+
 juce::var PluginHost::listPlugins()
 {
     reloadKnownPlugins();
@@ -270,30 +267,20 @@ juce::var PluginHost::createInstance (const juce::var& message)
     const auto pluginId = message["pluginId"].toString();
     const auto sampleRate = static_cast<double> (message.getProperty ("sampleRate", 44100.0));
 
-    reloadKnownPlugins();
-    const auto description = knownPlugins.getTypeForIdentifierString (pluginId);
-    if (description == nullptr)
-        throw CommandError ("Plugin não encontrado. Procure os plugins instalados de novo.");
-
     juce::String error;
-    auto plugin = formatManager.createPluginInstance (*description, sampleRate, blockSize, error);
+    auto plugin = createPlugin (pluginId, sampleRate, blockSize, error);
     if (plugin == nullptr)
-        throw CommandError ("Não foi possível carregar \"" + description->name + "\": " + error);
+        throw CommandError (error);
 
     const int id = nextInstanceId++;
     auto& instance = *(instances[id] = std::make_unique<Instance> (
         id, std::move (plugin), [this, id] (int index, float value) { onParameterChanged (id, index, value); }));
 
-    // Parâmetros não automatizáveis ficam de fora: em VST3 costumam ser os
-    // milhares de controladores MIDI internos ("MIDI CC 0"…), não ajustes do som.
-    juce::Array<juce::var> params;
-    for (auto* param : instance.plugin->getParameters())
-        if (param->isAutomatable())
-            params.add (describeParameter (*param));
+    const auto params = describeParameters (*instance.plugin);
 
     return juce::var (object ({ { "instanceId", id },
                                 { "pluginId", pluginId },
-                                { "name", description->name },
+                                { "name", instance.plugin->getName() },
                                 { "hasEditor", instance.plugin->hasEditor() },
                                 { "latency", instance.plugin->getLatencySamples() },
                                 { "params", params } }).get());
@@ -324,7 +311,8 @@ juce::var PluginHost::openEditor (const juce::var& message)
     if (instance.window == nullptr)
     {
         const int id = instance.id;
-        instance.window = std::make_unique<PluginWindow> (*instance.plugin, [this, id] { onEditorClosed (id); });
+        instance.window = std::make_unique<PluginWindow> (*instance.plugin, instance.plugin->getName(),
+                                                          [this, id] { onEditorClosed (id); });
     }
     else
     {

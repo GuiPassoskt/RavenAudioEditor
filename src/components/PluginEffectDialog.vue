@@ -45,27 +45,8 @@
           <q-input v-model="paramFilter" dense dark outlined clearable placeholder="Filtrar parâmetros" />
         </q-card-section>
 
-        <q-card-section class="col param-list q-gutter-y-sm">
-          <div v-for="p in visibleParams" :key="p.index">
-            <q-select
-              v-if="p.options.length > 1" :model-value="optionValue(p)" :options="optionsOf(p)" :label="p.name"
-              emit-value map-options dense dark outlined @update:model-value="v => setParam(p, v)"
-            />
-            <q-toggle
-              v-else-if="p.boolean" :model-value="p.value >= 0.5" :label="p.name" dark
-              @update:model-value="v => setParam(p, v ? 1 : 0)"
-            />
-            <template v-else>
-              <div class="row items-center justify-between no-wrap">
-                <span class="ellipsis">{{ p.name }}</span>
-                <span class="mono text-caption text-grey-5 q-ml-sm">{{ p.text }} {{ p.label }}</span>
-              </div>
-              <q-slider
-                :model-value="p.value" :min="0" :max="1" :step="stepOf(p)" dark dense color="primary"
-                @update:model-value="v => setParam(p, v)"
-              />
-            </template>
-          </div>
+        <q-card-section class="col param-list">
+          <PluginParamList :params="visibleParams" @set="setParam" />
           <div v-if="!instance.params.length" class="text-caption text-grey-6">
             Este plugin não expõe parâmetros. Use a interface do plugin.
           </div>
@@ -93,6 +74,7 @@ import { useUiStore } from 'src/stores/ui'
 import { engine } from 'src/audio/engine'
 import { nativePlugins } from 'src/audio/plugins'
 import { guard, notifyError } from 'src/composables/commands'
+import PluginParamList from 'components/PluginParamList.vue'
 
 const PREVIEW_SECONDS = 6 // igual ao EffectDialog
 const LAST_PLUGIN_KEY = 'rea.plugin.last'
@@ -122,9 +104,6 @@ const visibleParams = computed(() => {
   return f ? params.filter(p => p.name.toLowerCase().includes(f)) : params
 })
 
-const stepOf = p => (p.steps > 1 && p.steps <= 1000 ? 1 / (p.steps - 1) : 0)
-const optionsOf = p => p.options.map((label, i) => ({ label, value: i / (p.options.length - 1) }))
-const optionValue = p => Math.round(p.value * (p.options.length - 1)) / (p.options.length - 1)
 
 function filterPlugins (val, update) {
   update(() => { filter.value = val })

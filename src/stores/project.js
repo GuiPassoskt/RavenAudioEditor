@@ -19,7 +19,7 @@ import { engine, trackDuration } from 'src/audio/engine'
 import { decodeProject, download, encodeProject, encodeWav } from 'src/audio/fileio'
 import { parseMidi, writeMidi } from 'src/audio/midifile'
 import * as N from 'src/audio/notes'
-import { realtimeDef, realtimeDefaults } from 'src/audio/realtime'
+import { effectName, realtimeDefaults } from 'src/audio/realtime'
 import { nextTrackColor } from 'src/audio/colors'
 
 const HISTORY_LIMIT = 200
@@ -29,6 +29,7 @@ let clipboard = null
 let rafId = 0
 let rec = null
 let nextFxUid = 1
+let nextStateVersion = 1 // versão do estado de plugins: o motor nativo só recebe o estado quando ela muda
 
 const zeros = n => new Float32Array(Math.max(0, n))
 export const isMidi = t => t.kind === 'midi'
@@ -60,8 +61,11 @@ function makeTrack (props) {
 
 // Estado de um efeito em tempo real (RealtimeEffectState). Imutável: toda
 // alteração cria um objeto novo, para o histórico de undo continuar válido.
-function newEffectState ({ type, params, enabled = true }) {
-  return { uid: nextFxUid++, type, enabled, params: { ...realtimeDefaults(type), ...params } }
+// Plugins (Fase 3) guardam o "chunk" do plugin em base64 em `state` (null = de fábrica).
+function newEffectState ({ type, params, enabled = true, plugin, state = null }) {
+  const fx = { uid: nextFxUid++, type, enabled, params: { ...realtimeDefaults(type), ...params } }
+  if (type === 'plugin') Object.assign(fx, { plugin: { ...plugin }, state, stateVersion: nextStateVersion++ })
+  return fx
 }
 
 function setChannels (track, channels) {
@@ -262,6 +266,7 @@ export const useProjectStore = defineStore('project', {
       this.stop()
       this.historyIndex = i
       this.restore(this.history[i].state)
+      this.syncEngine() // plugins voltam ao estado daquele passo
     },
 
     // ---------- Projeto ----------
@@ -544,15 +549,38 @@ export const useProjectStore = defineStore('project', {
 
     addRealtimeEffect (target, type) {
       const obj = this.fxTarget(target)
-      obj.effects = [...obj.effects, newEffectState({ type })]
-      this.pushState(`Adicionado ${realtimeDef(type).name} em "${this.fxTargetName(target)}"`)
+      const fx = newEffectState({ type })
+      obj.effects = [...obj.effects, fx]
+      this.pushState(`Adicionado ${effectName(fx)} em "${this.fxTargetName(target)}"`)
       this.syncPlayback()
+    },
+    // plugin: { id, name, vendor, format } da lista do motor nativo.
+    addRealtimePlugin (target, plugin) {
+      const obj = this.fxTarget(target)
+      const fx = newEffectState({ type: 'plugin', plugin: { id: plugin.id, name: plugin.name, vendor: plugin.vendor, format: plugin.format } })
+      obj.effects = [...obj.effects, fx]
+      this.pushState(`Adicionado ${effectName(fx)} em "${this.fxTargetName(target)}"`)
+      this.syncPlayback()
+      return fx
+    },
+    // O motor avisou que o plugin mudou (janela nativa ou parâmetros). Ajustes
+    // seguidos no mesmo plugin viram um passo só do histórico. Devolve a versão nova.
+    setPluginStateByUid (uid, state) {
+      for (const obj of [this.master, ...this.tracks]) {
+        const fx = obj.effects?.find(e => String(e.uid) === String(uid))
+        if (!fx) continue
+        const stateVersion = nextStateVersion++
+        obj.effects = obj.effects.map(e => (e === fx ? { ...e, state, stateVersion } : e))
+        this.pushState(`Plugin ajustado: ${effectName(fx)}`, true)
+        return stateVersion
+      }
+      return null
     },
     removeRealtimeEffect (target, uid) {
       const obj = this.fxTarget(target)
       const fx = obj.effects.find(e => e.uid === uid)
       obj.effects = obj.effects.filter(e => e.uid !== uid)
-      this.pushState(`Removido ${realtimeDef(fx.type).name} de "${this.fxTargetName(target)}"`)
+      this.pushState(`Removido ${effectName(fx)} de "${this.fxTargetName(target)}"`)
       this.syncPlayback()
     },
     moveRealtimeEffect (target, uid, dir) {
@@ -602,10 +630,17 @@ export const useProjectStore = defineStore('project', {
     // Repassa mudanças de mix/efeitos para a reprodução em curso. Se a estrutura
     // de alguma cadeia mudou, reinicia a reprodução do ponto atual.
     syncPlayback () {
-      if (!this.playing) return
+      // Parado, o motor nativo também recebe o projeto: os plugins das cadeias
+      // ficam carregados (janela, parâmetros) e o primeiro play começa mais rápido.
+      if (!this.playing) return this.syncEngine()
       if (engine.updateMix(this.tracks, this.master)) return
       const { t1, isSelection } = this.playRange
       this.play({ t0: engine.position(), t1, isSelection })
+    },
+
+    // Só o motor nativo precisa disso; no Web Audio o grafo existe só tocando.
+    syncEngine () {
+      return engine.syncIdle?.(this.tracks, this.master, this.rate)
     },
 
     // ---------- MIDI ----------

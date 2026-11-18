@@ -26,14 +26,17 @@
             :model-value="fx.enabled" dense dark size="sm" color="positive"
             :title="fx.enabled ? 'Desligar (bypass)' : 'Ligar'" @update:model-value="store.toggleRealtimeEffect(ui.fxTarget, fx.uid)"
           />
-          <div class="col q-ml-xs ellipsis fx-name" @click="toggleOpen(fx.uid)">{{ def(fx).name }}</div>
+          <div class="col q-ml-xs ellipsis fx-name" @click="toggleOpen(fx.uid)">
+            <q-icon v-if="fx.type === 'plugin'" name="mdi-puzzle-outline" size="14px" class="q-mr-xs text-grey-5" />{{ effectName(fx) }}
+          </div>
           <q-btn flat dense round size="xs" icon="arrow_upward" :disable="i === 0" title="Mover para cima" @click="store.moveRealtimeEffect(ui.fxTarget, fx.uid, -1)" />
           <q-btn flat dense round size="xs" icon="arrow_downward" :disable="i === target.effects.length - 1" title="Mover para baixo" @click="store.moveRealtimeEffect(ui.fxTarget, fx.uid, 1)" />
           <q-btn flat dense round size="xs" :icon="closed[fx.uid] ? 'expand_more' : 'expand_less'" @click="toggleOpen(fx.uid)" />
           <q-btn flat dense round size="xs" icon="delete" color="grey-5" title="Remover" @click="store.removeRealtimeEffect(ui.fxTarget, fx.uid)" />
         </div>
         <div v-if="!closed[fx.uid]" class="fx-body">
-          <template v-for="p in def(fx).params" :key="p.key">
+          <PluginSlotBody v-if="fx.type === 'plugin'" :fx="fx" />
+          <template v-for="p in def(fx)?.params ?? []" :key="p.key">
             <div v-if="p.type === 'number'" class="param">
               <div class="row justify-between text-caption">
                 <span>{{ p.label }}</span>
@@ -62,8 +65,19 @@
               <q-item-label caption class="mono">{{ d.source }}</q-item-label>
             </q-item-section>
           </q-item>
+          <template v-if="hasNativeEngine">
+            <q-separator dark />
+            <q-item v-close-popup clickable @click="pickerOpen = true">
+              <q-item-section avatar style="min-width: 28px"><q-icon name="mdi-puzzle-outline" size="18px" /></q-item-section>
+              <q-item-section>
+                <q-item-label>Plugin (VST3 / LV2)…</q-item-label>
+                <q-item-label caption>Plugins instalados no computador</q-item-label>
+              </q-item-section>
+            </q-item>
+          </template>
         </q-list>
       </q-btn-dropdown>
+      <PluginPickerDialog v-if="hasNativeEngine" v-model="pickerOpen" @pick="addPlugin" />
     </div>
 
     <template v-if="target && ui.fxTarget !== 'master'">
@@ -83,15 +97,19 @@
 // Painel de efeitos em tempo real de uma faixa ou do master — o equivalente ao
 // RealtimeEffectPanel do Audacity 3.2+ (src/effects/RealtimeEffectPanel.cpp).
 
-import { computed, reactive } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { useProjectStore } from 'src/stores/project'
 import { useUiStore } from 'src/stores/ui'
-import { REALTIME_EFFECTS, realtimeDef } from 'src/audio/realtime'
+import { REALTIME_EFFECTS, effectName, realtimeDef } from 'src/audio/realtime'
+import { hasNativeEngine } from 'src/audio/plugins'
 import { guard } from 'src/composables/commands'
+import PluginPickerDialog from 'components/PluginPickerDialog.vue'
+import PluginSlotBody from 'components/PluginSlotBody.vue'
 
 const store = useProjectStore()
 const ui = useUiStore()
 const closed = reactive({})
+const pickerOpen = ref(false)
 
 const target = computed(() => (ui.fxTarget === 'master' ? store.master : store.findTrack(ui.fxTarget)))
 const targetOptions = computed(() => [
@@ -104,6 +122,7 @@ const toggleOpen = uid => { closed[uid] = !closed[uid] }
 const fmt = (v, p) => `${Number(v).toFixed(p.step < 0.1 ? 2 : p.step < 1 ? 1 : 0)}${p.unit ? ' ' + p.unit : ''}`
 
 const add = type => guard(() => store.addRealtimeEffect(ui.fxTarget, type))
+const addPlugin = plugin => plugin && guard(() => store.addRealtimePlugin(ui.fxTarget, plugin))
 const renderTrack = () => guard(() => store.renderTrackEffects(ui.fxTarget), { loading: true })
 </script>
 

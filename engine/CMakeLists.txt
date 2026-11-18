@@ -25,6 +25,7 @@ target_sources(RavenEngine PRIVATE
   src/AudioEngine.cpp
   src/Main.cpp
   src/MixGraph.cpp
+  src/PluginEffect.cpp
   src/PluginHost.cpp
   src/Protocol.cpp
   src/RealtimeEffects.cpp

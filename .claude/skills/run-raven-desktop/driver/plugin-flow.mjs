@@ -34,7 +34,7 @@ try {
   await c.waitFor(`!!document.querySelector('.menu-bar')`, 60000)
   await c.sleep(1500)
   // Fecha a tela de abertura e diálogos que tenham ficado abertos de outra rodada.
-  await c.evaluate(`Object.assign(${store('ui')}, { splashOpen: false, pluginEffect: false, effect: null, audioDevicesOpen: false, aboutOpen: false })`)
+  await c.evaluate(`Object.assign(${store('ui')}, { splashOpen: false, pluginEffect: false, effect: null, audioDevicesOpen: false, aboutOpen: false, fxTarget: null })`)
   await c.sleep(500)
   await c.evaluate(`${store('project')}.resetProject()`)
   await c.sleep(500)
@@ -42,18 +42,15 @@ try {
   check(engine?.available, 'motor encontrado', engine?.binary)
 
   // 2. Faixa estéreo com um tom de 5 s, tudo selecionado
-  await c.clickText('Faixas', '.menu-bar .q-btn'); await c.sleep(400)
-  await c.clickText('Nova faixa estéreo', '.q-menu .q-item'); await c.sleep(600)
-  await c.clickText('Gerar', '.menu-bar .q-btn'); await c.sleep(400)
-  await c.clickText('Tom', '.q-menu .q-item'); await c.sleep(700)
+  await c.menu('Faixas', 'Nova faixa estéreo'); await c.sleep(600)
+  await c.menu('Gerar', 'Tom'); await c.sleep(700)
   await c.clickText('Aplicar', '.effect-card button'); await c.sleep(1200)
   await c.key('a', { ctrl: true, code: 'KeyA', keyCode: 65 }); await c.sleep(400)
   const before = await peaks()
   check(before.length === 2 && before.every(p => p.total === 0.8), 'tom estéreo gerado', JSON.stringify(before))
 
   // 3. Diálogo do plugin (espera a varredura e o carregamento do último plugin)
-  await c.clickText('Efeito', '.menu-bar .q-btn'); await c.sleep(400)
-  await c.clickText('Plugin (VST3', '.q-menu .q-item')
+  await c.menu('Efeito', 'Plugin (VST3')
   await c.waitFor(`!!document.querySelector('.plugin-card') && !document.querySelector('.plugin-card .q-linear-progress') && !document.querySelector('.q-loading')`, 300000)
   // O diálogo carrega sozinho o último plugin usado: espera isso antes de escolher.
   await c.waitFor(`document.querySelector('.plugin-card .text-h6')?.innerText !== 'Plugin' && !document.querySelector('.q-loading')`, 10000)
@@ -68,7 +65,7 @@ try {
     await c.sleep(500)
   }
   check(await dialogText() === 'kHs Gain', 'kHs Gain carregado')
-  const controls = await c.evaluate(`Object.fromEntries([...document.querySelectorAll('.plugin-card .param-list > div')].map(d =>
+  const controls = await c.evaluate(`Object.fromEntries([...document.querySelectorAll('.plugin-card .param-list .q-gutter-y-sm > div')].map(d =>
     [d.innerText.split(String.fromCharCode(10))[0], d.querySelector('.q-select') ? 'lista' : d.querySelector('.q-toggle') ? 'liga/desliga' : 'slider']))`)
   check(controls.Gain === 'slider' && controls.mode === 'lista', 'tipos dos controles', JSON.stringify(controls))
 
@@ -80,10 +77,10 @@ try {
   let gainText = ''
   for (let attempt = 0; attempt < 3 && !minus18.test(gainText); attempt++) {
     await c.waitFor(`!document.querySelector('.q-loading')`, 30000); await c.sleep(800)
-    const slider = await c.evaluate(`(() => { const row = [...document.querySelectorAll('.plugin-card .param-list > div')].find(d => d.innerText.startsWith('Gain'));
+    const slider = await c.evaluate(`(() => { const row = [...document.querySelectorAll('.plugin-card .param-list .q-gutter-y-sm > div')].find(d => d.innerText.startsWith('Gain'));
       const r = row.querySelector('.q-slider').getBoundingClientRect(); return { x: r.x + r.width * 0.2, y: r.y + r.height / 2 } })()`)
     await c.clickAt(slider.x, slider.y); await c.sleep(800)
-    gainText = await c.evaluate(`[...document.querySelectorAll('.plugin-card .param-list > div')].find(d => d.innerText.startsWith('Gain')).innerText.split(String.fromCharCode(10)).join(' ')`)
+    gainText = await c.evaluate(`[...document.querySelectorAll('.plugin-card .param-list .q-gutter-y-sm > div')].find(d => d.innerText.startsWith('Gain')).innerText.split(String.fromCharCode(10)).join(' ')`)
   }
   check(minus18.test(gainText), 'Gain ajustado', gainText)
   await c.clickText('Prévia', '.plugin-card button'); await c.sleep(1500)

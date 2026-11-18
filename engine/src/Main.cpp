@@ -41,7 +41,7 @@ public:
 
         host = std::make_unique<raven::PluginHost> (cacheFile);
         audio = std::make_unique<raven::AudioEngine> (
-            juce::File (juce::SystemStats::getEnvironmentVariable ("RAVEN_AUDIO_SETTINGS", {})));
+            juce::File (juce::SystemStats::getEnvironmentVariable ("RAVEN_AUDIO_SETTINGS", {})), *host);
 
         raven::startStdinReader ([this] (const juce::String& line) { handleLine (line); },
                                  [this] { quit(); });

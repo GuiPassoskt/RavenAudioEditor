@@ -33,6 +33,9 @@ public:
 
     double getSampleRate() const noexcept { return sampleRate; }
 
+    // Atraso que o efeito introduz, em amostras (plugins). O grafo compensa (PDC).
+    virtual int getLatencySamples() const { return 0; }
+
     const juce::String type;
 
 protected:
