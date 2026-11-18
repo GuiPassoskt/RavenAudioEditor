@@ -31,14 +31,18 @@ export async function guard (fn, { loading = false } = {}) {
   }
 }
 
-function confirmDiscard (store) {
+// Também usado ao fechar o app desktop (EditorPage.vue), com outro texto e botão.
+export function confirmDiscard (store, {
+  message = 'O projeto atual tem alterações não salvas. Deseja descartá-las?',
+  ok = 'Descartar'
+} = {}) {
   if (!store.dirty) return Promise.resolve(true)
   return new Promise(resolve => {
     Dialog.create({
       title: 'Alterações não salvas',
-      message: 'O projeto atual tem alterações não salvas. Deseja descartá-las?',
+      message,
       cancel: { label: 'Cancelar', flat: true },
-      ok: { label: 'Descartar', color: 'negative' },
+      ok: { label: ok, color: 'negative' },
       dark: true
     }).onOk(() => resolve(true)).onCancel(() => resolve(false))
   })

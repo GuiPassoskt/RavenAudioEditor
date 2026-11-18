@@ -31,6 +31,19 @@ import { quasarRuntime } from '#q-app/electron/preload'
 contextBridge.exposeInMainWorld("quasarRuntime", quasarRuntime)
 
 /**
+ * Janela do app: o main pede confirmação para fechar com alterações não salvas
+ * (EditorPage.vue mostra o diálogo do app) e fecha quando o usuário confirma.
+ */
+contextBridge.exposeInMainWorld('desktop', {
+  onConfirmClose (callback) {
+    const listener = () => callback()
+    ipcRenderer.on('app:confirm-close', listener)
+    return () => ipcRenderer.removeListener('app:confirm-close', listener)
+  },
+  closeApp: () => ipcRenderer.invoke('app:close')
+})
+
+/**
  * Motor de áudio nativo (raven-engine), usado pelo renderer em src/audio/plugins.js.
  * A comunicação com o motor fica no processo main (engine-host.js).
  */

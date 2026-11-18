@@ -11,7 +11,7 @@
 <script setup>
 import { onBeforeUnmount, onMounted } from 'vue'
 import { useProjectStore } from 'src/stores/project'
-import { keyName, useCommands } from 'src/composables/commands'
+import { confirmDiscard, keyName, useCommands } from 'src/composables/commands'
 import TracksArea from 'components/TracksArea.vue'
 import MixerBoard from 'components/MixerBoard.vue'
 import PianoRoll from 'components/PianoRoll.vue'
@@ -44,8 +44,26 @@ function onBeforeUnload (e) {
   }
 }
 
+// App desktop: o botão fechar com alterações não salvas pergunta com o diálogo do app.
+let confirmingClose = false
+async function onConfirmClose () {
+  if (confirmingClose) return
+  confirmingClose = true
+  try {
+    const discard = await confirmDiscard(store, {
+      message: 'O projeto atual tem alterações não salvas. Se sair agora, elas serão perdidas.',
+      ok: 'Descartar e sair'
+    })
+    if (discard) window.desktop.closeApp()
+  } finally {
+    confirmingClose = false
+  }
+}
+let offConfirmClose = () => {}
+
 onMounted(() => {
   if (!store.history.length) store.resetProject()
+  if (window.desktop) offConfirmClose = window.desktop.onConfirmClose(onConfirmClose)
   // Tela de abertura, a menos que o usuário tenha marcado "Não mostrar ao iniciar".
   let hideSplash = false
   try { hideSplash = localStorage.getItem('raven.splash.hide') === '1' } catch { /* sem storage */ }
@@ -55,6 +73,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  offConfirmClose()
   window.removeEventListener('keydown', onKey, true)
   window.removeEventListener('beforeunload', onBeforeUnload)
 })

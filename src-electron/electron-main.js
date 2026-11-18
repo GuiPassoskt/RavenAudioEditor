@@ -76,6 +76,22 @@ async function createWindow () {
     return { action: 'deny' }
   })
 
+  // Com alterações não salvas, a página bloqueia o fechamento (beforeunload, em
+  // EditorPage.vue). O navegador perguntaria ao usuário; o Electron só cancela em
+  // silêncio, e o botão fechar parecia não funcionar. Aqui o fechamento fica
+  // cancelado e a interface pergunta, com o diálogo do próprio app; se o usuário
+  // confirmar, ela pede "app:close" e o bloqueio passa a ser ignorado.
+  let closeConfirmed = false
+  mainWindow.webContents.on('will-prevent-unload', event => {
+    if (closeConfirmed) event.preventDefault()
+    else mainWindow.webContents.send('app:confirm-close')
+  })
+  ipcMain.removeHandler('app:close')
+  ipcMain.handle('app:close', () => {
+    closeConfirmed = true
+    mainWindow.close()
+  })
+
   if (import.meta.env.QUASAR_DEV) {
     await mainWindow.loadURL(import.meta.env.QUASAR_APP_URL)
   } else {
