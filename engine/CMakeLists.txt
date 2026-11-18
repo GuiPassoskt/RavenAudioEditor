@@ -22,10 +22,14 @@ juce_add_gui_app(RavenEngine
   NEEDS_CURL FALSE)
 
 target_sources(RavenEngine PRIVATE
+  src/AudioEngine.cpp
   src/Main.cpp
+  src/MixGraph.cpp
   src/PluginHost.cpp
   src/Protocol.cpp
-  src/Scanner.cpp)
+  src/RealtimeEffects.cpp
+  src/Scanner.cpp
+  src/Synth.cpp)
 
 target_compile_definitions(RavenEngine PRIVATE
   JUCE_PLUGINHOST_VST3=1
@@ -37,9 +41,8 @@ target_compile_definitions(RavenEngine PRIVATE
   JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:RavenEngine,JUCE_VERSION>")
 
 # ASIO (Windows): o JUCE 9 já traz o ASIO SDK 2.3, usado aqui sob a opção GPLv3
-# (seção 7 do documento). Só faz diferença quando o motor tocar áudio (Fase 2).
-#   cmake ... -DRAVEN_ASIO=ON
-option(RAVEN_ASIO "Suporte a drivers ASIO no Windows" OFF)
+# (seção 7 do documento). Para desligar: cmake ... -DRAVEN_ASIO=OFF
+option(RAVEN_ASIO "Suporte a drivers ASIO no Windows" ON)
 if(WIN32 AND RAVEN_ASIO)
   target_compile_definitions(RavenEngine PRIVATE JUCE_ASIO=1)
 endif()

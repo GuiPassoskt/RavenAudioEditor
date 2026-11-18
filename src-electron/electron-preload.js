@@ -39,6 +39,8 @@ contextBridge.exposeInMainWorld('audio', {
   request: (cmd, args) => ipcRenderer.invoke('engine:request', cmd, args),
   scanPlugins: options => ipcRenderer.invoke('engine:scan', options),
   process: (instanceId, channels, sampleRate) => ipcRenderer.invoke('engine:process', instanceId, channels, sampleRate),
+  sendAudio: (cmd, args, channels) => ipcRenderer.invoke('engine:sendAudio', cmd, args, channels),
+  receiveAudio: (cmd, args) => ipcRenderer.invoke('engine:receiveAudio', cmd, args),
   onEvent (callback) {
     const listener = (_event, name, payload) => callback(name, payload)
     ipcRenderer.on('engine:event', listener)

@@ -1,6 +1,6 @@
 ---
 name: run-raven-desktop
-description: Abre e controla o app desktop do Raven Audio Editor (Electron + motor JUCE raven-engine) para testar de verdade o fluxo Efeito → Plugin (VST3 / LV2)…, o motor nativo e a tela Sobre. Use para rodar, testar, tirar prints ou confirmar uma mudança no app desktop, no motor (engine/) ou no diálogo de plugins.
+description: Abre e controla o app desktop do Raven Audio Editor (Electron + motor JUCE raven-engine) para testar de verdade a reprodução, a mixagem, os efeitos em tempo real, a gravação e os dispositivos de áudio do motor nativo, o fluxo Efeito → Plugin (VST3 / LV2)… e a tela Sobre. Use para rodar, testar, tirar prints ou confirmar uma mudança no app desktop, no motor (engine/), no motor de áudio nativo ou no diálogo de plugins.
 ---
 
 # Rodar e testar o Raven Audio Editor desktop
@@ -11,8 +11,12 @@ O app é controlado pelo protocolo de depuração do Chromium (CDP), com o
 
 Arquivos desta skill:
 - `driver/cdplib.mjs`: clicar, teclar, avaliar JS na página, tirar print.
-- `driver/plugin-flow.mjs`: cenário completo pela interface, com 9 verificações.
-- `driver/engine-smoke.mjs`: testa o motor sozinho (ping, lista, processamento).
+- `driver/plugin-flow.mjs`: Efeito → Plugin pela interface, com 9 verificações (Fase 1).
+- `driver/transport-flow.mjs`: tocar, mix ao vivo, fim do trecho, gravar com R e
+  dispositivos de áudio pela interface, com 8 verificações (Fase 2). Toca um tom baixo.
+- `driver/engine-smoke.mjs`: plugins no motor sozinho (ping, lista, processamento).
+- `driver/engine-audio.mjs`: motor de áudio sozinho: ganho/pan exatos, os 8 efeitos,
+  MIDI, e com `--live` reprodução e gravação (25 verificações).
 
 ## Pré-requisitos
 
@@ -35,6 +39,20 @@ Arquivos desta skill:
 - **Motor travado em uso**: com o app aberto, matar o `raven-engine` não adianta,
   porque o `engine-host.js` o reinicia na hora e o arquivo fica travado. A cópia
   para `engine/bin` falha. **Feche o app antes de recompilar o motor.**
+- **Janela escondida**: se o app estiver atrás de outra janela ou minimizado, o
+  Chromium suspende o `requestAnimationFrame`, e `store.playhead`/`store.levels`
+  param de atualizar (o som continua). Para checar o motor, use
+  `import('/src/audio/engine.js').then(m => m.engine.position())` no `evaluate`.
+- **Teclas no CDP**: letras sem modificador precisam de `keyDown` com `text` (o
+  `cdplib.mjs` já faz); com `rawKeyDown` o atalho R não dispara.
+- **Primeira gravação** leva ~2 s para começar (o WASAPI reabre o dispositivo para
+  ligar a entrada); espere `store.recording` antes de contar o tempo. As seguintes
+  começam na hora.
+- **Entrada padrão** é a do Windows; nesta máquina é o "CABLE Output (VB-Audio
+  Virtual Cable)", que grava silêncio. Para testar som de verdade, escolha o
+  microfone em Transporte → Dispositivos de áudio… (ou `audio.setDevice` com `input`).
+- **Campo `id` no protocolo**: o `id` de cada pedido sobrescreve campos de mesmo
+  nome; por isso clipes usam `clipId`.
 - **Modo dev**: o DevTools abre encaixado (a página fica com ~725 px) e também
   aparece como alvo "page" no CDP. O `cdplib.mjs` já escolhe a página do app
   (URL http/file).
@@ -55,6 +73,7 @@ APP="dist/electron/Packaged/Raven Audio Editor-win32-x64/raven-audio-editor.exe"
 ("$APP" --remote-debugging-port=9333 > /tmp/raven-app.log 2>&1 &)
 for i in $(seq 1 20); do sleep 1; curl -s http://127.0.0.1:9333/json | grep -q index.html && break; done
 node .claude/skills/run-raven-desktop/driver/plugin-flow.mjs ./raven-prints 9333
+node .claude/skills/run-raven-desktop/driver/transport-flow.mjs ./raven-prints 9333
 ```
 
 ## Caminho B: modo dev (testa o motor em `engine/bin/`)
@@ -98,10 +117,27 @@ export RAVEN_PLUGIN_CACHE="$(cygpath -w "$D/known-plugins.xml")" RAVEN_SCAN_PEDA
 echo '{"id":1,"cmd":"ping"}' | engine/bin/raven-engine.exe           # responde {"id":1,"ok":true,...}
 engine/bin/raven-engine.exe --scan > "$D/scan.log"                    # termina com {"event":"scan.done","count":N}
 node .claude/skills/run-raven-desktop/driver/engine-smoke.mjs "$(cygpath -w engine/bin/raven-engine.exe)" "$(cygpath -w "$D")"
+node .claude/skills/run-raven-desktop/driver/engine-audio.mjs "$(cygpath -w engine/bin/raven-engine.exe)" "$(cygpath -w "$D")" --live
 ```
 
 O `engine-smoke.mjs` exige RMS a −18 dB com erro < 0,001 (dá 0,0445 exato).
 Avisos `lilv ... Reloading plugin` no stderr da varredura são inofensivos.
+
+## Paridade com o motor Web Audio (modo dev)
+
+No modo dev, a página importa os módulos pelo Vite, então dá para renderizar o
+mesmo projeto nos dois motores e comparar:
+
+```js
+const { engine, webEngine } = await import('/src/audio/engine.js')
+const args = { tracks, rate: 44100, t0: 0, t1: 2, master: { gain: 0, effects: [] }, channels: 2 }
+const [web, nativo] = [await webEngine.render(args), await engine.render(args)]
+```
+
+Resultado em 18/11/2026: 0 dB de diferença em ganho/pan, Graves e Agudos, filtros,
+distorção e MIDI; eco e reverb batem com ruído (com tons puros, o eco difere pelo
+atraso extra de 128 amostras do Chromium e o reverb pela resposta ao impulso
+aleatória). Detalhes na seção 4.6 de docs/INTEGRACAO-PLUGINS-NATIVOS.md.
 
 ## Tela Sobre (licenças)
 

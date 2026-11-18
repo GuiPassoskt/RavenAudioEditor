@@ -8,8 +8,10 @@
 //   raven-engine --scan   procura plugins, grava a lista e termina
 //
 // Caminhos vêm por variáveis de ambiente, para não depender de aspas na linha
-// de comando: RAVEN_PLUGIN_CACHE (lista de plugins) e RAVEN_SCAN_PEDAL.
+// de comando: RAVEN_PLUGIN_CACHE (lista de plugins), RAVEN_SCAN_PEDAL e
+// RAVEN_AUDIO_SETTINGS (dispositivo de áudio escolhido).
 
+#include "AudioEngine.h"
 #include "PluginHost.h"
 #include "Protocol.h"
 #include "Scanner.h"
@@ -38,6 +40,8 @@ public:
         }
 
         host = std::make_unique<raven::PluginHost> (cacheFile);
+        audio = std::make_unique<raven::AudioEngine> (
+            juce::File (juce::SystemStats::getEnvironmentVariable ("RAVEN_AUDIO_SETTINGS", {})));
 
         raven::startStdinReader ([this] (const juce::String& line) { handleLine (line); },
                                  [this] { quit(); });
@@ -47,6 +51,7 @@ public:
 
     void shutdown() override
     {
+        audio.reset();
         host.reset();
     }
 
@@ -76,7 +81,16 @@ private:
 
         try
         {
-            raven::sendResult (id, host->handle (cmd, message));
+            if (raven::AudioEngine::handles (cmd))
+            {
+                raven::sendResult (id, audio->handle (cmd, message));
+                return;
+            }
+
+            auto result = host->handle (cmd, message);
+            if (cmd == "ping")
+                result.getDynamicObject()->setProperty ("audio", audio->status());
+            raven::sendResult (id, result);
         }
         catch (const std::exception& e)
         {
@@ -85,6 +99,7 @@ private:
     }
 
     std::unique_ptr<raven::PluginHost> host;
+    std::unique_ptr<raven::AudioEngine> audio;
 };
 
 START_JUCE_APPLICATION (RavenEngineApplication)

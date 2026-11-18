@@ -207,46 +207,6 @@ static void renderOffline (juce::AudioPluginInstance& plugin, const juce::AudioB
     plugin.releaseResources();
 }
 
-// Áudio entre o Electron e o motor: Float32 planar (um canal inteiro depois do outro).
-static void readPlanar (const juce::File& file, juce::AudioBuffer<float>& buffer)
-{
-    juce::FileInputStream in (file);
-    if (in.failedToOpen())
-        throw CommandError ("Não foi possível ler " + file.getFullPathName());
-
-    constexpr int chunkBytes = 1 << 24;
-
-    for (int c = 0; c < buffer.getNumChannels(); ++c)
-    {
-        auto* dest = reinterpret_cast<char*> (buffer.getWritePointer (c));
-        auto remaining = (juce::int64) buffer.getNumSamples() * (juce::int64) sizeof (float);
-
-        while (remaining > 0)
-        {
-            const int wanted = (int) juce::jmin<juce::int64> (remaining, chunkBytes);
-            if (in.read (dest, wanted) != wanted)
-                throw CommandError ("Arquivo de áudio incompleto: " + file.getFullPathName());
-
-            dest += wanted;
-            remaining -= wanted;
-        }
-    }
-}
-
-static void writePlanar (const juce::File& file, const juce::AudioBuffer<float>& buffer)
-{
-    file.deleteFile();
-    juce::FileOutputStream out (file);
-    if (out.failedToOpen())
-        throw CommandError ("Não foi possível gravar " + file.getFullPathName());
-
-    for (int c = 0; c < buffer.getNumChannels(); ++c)
-        if (! out.write (buffer.getReadPointer (c), (size_t) buffer.getNumSamples() * sizeof (float)))
-            throw CommandError ("Falha ao gravar " + file.getFullPathName());
-
-    out.flush();
-}
-
 //==============================================================================
 PluginHost::PluginHost (juce::File cacheFileIn)
     : cacheFile (std::move (cacheFileIn))
@@ -393,7 +353,7 @@ juce::var PluginHost::process (const juce::var& message)
         throw CommandError ("Parâmetros de áudio inválidos.");
 
     juce::AudioBuffer<float> input (numChannels, (int) numFrames);
-    readPlanar (juce::File (message["input"].toString()), input);
+    readPlanarFile (juce::File (message["input"].toString()), input);
 
     juce::AudioBuffer<float> output;
 
@@ -420,7 +380,7 @@ juce::var PluginHost::process (const juce::var& message)
         renderOffline (plugin, input, output, sampleRate);
     }
 
-    writePlanar (juce::File (message["output"].toString()), output);
+    writePlanarFile (juce::File (message["output"].toString()), output);
 
     return juce::var (object ({ { "frames", numFrames }, { "latency", plugin.getLatencySamples() } }).get());
 }

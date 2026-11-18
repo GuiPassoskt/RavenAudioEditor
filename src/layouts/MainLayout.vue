@@ -26,6 +26,7 @@
 
     <EffectDialog />
     <PluginEffectDialog v-if="hasNativeEngine" />
+    <AudioDevicesDialog v-if="hasNativeEngine" />
     <AnalysisDialogs />
     <InfoDialogs />
     <SplashDialog />
@@ -41,6 +42,7 @@ import SelectionBar from 'components/SelectionBar.vue'
 import HistoryPanel from 'components/HistoryPanel.vue'
 import EffectDialog from 'components/EffectDialog.vue'
 import PluginEffectDialog from 'components/PluginEffectDialog.vue'
+import AudioDevicesDialog from 'components/AudioDevicesDialog.vue'
 import AnalysisDialogs from 'components/AnalysisDialogs.vue'
 import InfoDialogs from 'components/InfoDialogs.vue'
 import RealtimeEffectsPanel from 'components/RealtimeEffectsPanel.vue'

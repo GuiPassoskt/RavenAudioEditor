@@ -10,7 +10,8 @@ export const hasNativeEngine = !!bridge
 // O Electron prefixa erros vindos do main: "Error invoking remote method 'x': Error: ...".
 const cleanError = e => new Error(String(e?.message ?? e).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''))
 
-async function call (fn) {
+// Chama o bridge e devolve erros sem o prefixo do Electron (usado também por engine-native.js).
+export async function call (fn) {
   if (!bridge) throw new Error('Plugins nativos só estão disponíveis no aplicativo desktop.')
   try {
     return await fn()

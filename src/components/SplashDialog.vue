@@ -32,12 +32,23 @@
           <section>
             <h6>Motor de áudio</h6>
             <dl>
-              <dt>API</dt><dd>Web Audio API</dd>
+              <template v-if="info.native">
+                <dt>API</dt><dd>Nativo (JUCE) · {{ info.native.type }}</dd>
+                <dt>Dispositivo</dt><dd class="ellipsis">{{ info.native.device || '…' }}</dd>
+              </template>
+              <template v-else>
+                <dt>API</dt><dd>Web Audio API</dd>
+              </template>
               <dt>Taxa do dispositivo</dt><dd class="mono">{{ info.sampleRate ? info.sampleRate + ' Hz' : '…' }}</dd>
               <dt>Taxa do projeto</dt><dd class="mono">{{ store.rate }} Hz · 32-bit float</dd>
-              <dt>Latência base</dt><dd class="mono">{{ ms(info.baseLatency) }}</dd>
-              <dt>Canais de saída</dt><dd class="mono">{{ info.maxChannels ?? '…' }}</dd>
-              <dt>AudioWorklet</dt><dd><Flag :on="info.worklet" yes="disponível" no="indisponível" /></dd>
+              <dt>Latência{{ info.native ? ' de saída' : ' base' }}</dt><dd class="mono">{{ ms(info.baseLatency) }}</dd>
+              <template v-if="info.native">
+                <dt>Buffer</dt><dd class="mono">{{ info.native.bufferSize }} amostras</dd>
+              </template>
+              <template v-else>
+                <dt>Canais de saída</dt><dd class="mono">{{ info.maxChannels ?? '…' }}</dd>
+                <dt>AudioWorklet</dt><dd><Flag :on="info.worklet" yes="disponível" no="indisponível" /></dd>
+              </template>
             </dl>
           </section>
 
@@ -101,6 +112,7 @@
 import { h, reactive, ref, watch, version as vueVersion } from 'vue'
 import { useProjectStore } from 'src/stores/project'
 import { useUiStore } from 'src/stores/ui'
+import { engine, engineReady } from 'src/audio/engine'
 import pkg from '../../package.json'
 
 const HIDE_KEY = 'raven.splash.hide' // a mesma chave é lida em EditorPage.vue
@@ -143,6 +155,14 @@ const pause = t => new Promise(r => setTimeout(r, t))
 // Cada etapa é uma verificação real; a pausa curta só deixa o progresso legível.
 const STEPS = [
   ['Iniciando motor de áudio', async () => {
+    // No desktop, o motor nativo (JUCE) substitui a Web Audio API.
+    if (await engineReady === 'native') {
+      const status = await engine.status()
+      info.native = status
+      info.sampleRate = status.sampleRate
+      info.baseLatency = status.latencyMs / 1000
+      return
+    }
     const Ctx = window.AudioContext || window.webkitAudioContext
     const ctx = new Ctx()
     info.sampleRate = ctx.sampleRate

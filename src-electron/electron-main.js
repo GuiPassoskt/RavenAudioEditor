@@ -10,10 +10,19 @@ import { EngineHost } from './engine-host.js'
 // needed in case process is undefined under Linux
 const platform = process.platform || os.platform()
 
-// Comandos do motor nativo que a interface pode pedir (engine/src/PluginHost.cpp).
+// Comandos do motor nativo que a interface pode pedir (engine/src/PluginHost.cpp
+// e engine/src/AudioEngine.cpp). Os que trocam áudio passam por arquivos temporários.
 const ENGINE_COMMANDS = new Set([
-  'ping', 'plugins.list', 'fx.create', 'fx.setParam', 'fx.openEditor', 'fx.closeEditor', 'fx.destroy'
+  'ping', 'plugins.list', 'fx.create', 'fx.setParam', 'fx.openEditor', 'fx.closeEditor', 'fx.destroy',
+  'audio.status', 'audio.devices', 'audio.setDevice', 'project.sync', 'project.setRate', 'clips.release',
+  'transport.play', 'transport.stop', 'preview.stop', 'synth.audition', 'capture.start', 'capture.stop'
 ])
+const ENGINE_SEND_AUDIO = new Set(['clips.load', 'preview.play'])
+const ENGINE_RECEIVE_AUDIO = new Set(['render.offline', 'capture.read'])
+
+const allowed = (set, cmd) => {
+  if (!set.has(cmd)) throw new Error(`Comando do motor não permitido: ${cmd}`)
+}
 
 const engine = new EngineHost({
   onEvent: (name, payload) => {
@@ -24,8 +33,16 @@ const engine = new EngineHost({
 function registerEngineIpc () {
   ipcMain.handle('engine:status', () => engine.status())
   ipcMain.handle('engine:request', (_e, cmd, args) => {
-    if (!ENGINE_COMMANDS.has(cmd)) throw new Error(`Comando do motor não permitido: ${cmd}`)
+    allowed(ENGINE_COMMANDS, cmd)
     return engine.request(cmd, args)
+  })
+  ipcMain.handle('engine:sendAudio', (_e, cmd, args, channels) => {
+    allowed(ENGINE_SEND_AUDIO, cmd)
+    return engine.sendAudio(cmd, args, channels)
+  })
+  ipcMain.handle('engine:receiveAudio', (_e, cmd, args) => {
+    allowed(ENGINE_RECEIVE_AUDIO, cmd)
+    return engine.receiveAudio(cmd, args)
   })
   ipcMain.handle('engine:scan', (_e, options) => engine.scan(options))
   ipcMain.handle('engine:process', (_e, instanceId, channels, sampleRate) => engine.process(instanceId, channels, sampleRate))

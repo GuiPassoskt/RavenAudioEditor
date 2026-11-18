@@ -7,6 +7,7 @@
 //                      {"id": 7, "ok": false, "error": "mensagem"}
 //   evento   (stdout): {"event": "fx.paramChanged", ...dados}
 
+#include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_core/juce_core.h>
 
 #include <functional>
@@ -34,6 +35,11 @@ void sendError (const juce::var& id, const juce::String& message);
 // onClosed é chamado quando o Electron fecha o pipe (o app foi encerrado).
 void startStdinReader (std::function<void (const juce::String&)> onLine,
                        std::function<void()> onClosed);
+
+// Áudio entre o Electron e o motor: arquivos Float32 planares (um canal inteiro
+// depois do outro). O buffer de leitura já precisa ter o tamanho certo.
+void readPlanarFile (const juce::File& file, juce::AudioBuffer<float>& buffer);
+void writePlanarFile (const juce::File& file, const juce::AudioBuffer<float>& buffer);
 
 // Atalho para montar objetos JSON: object ({{"a", 1}, {"b", "x"}}).
 juce::DynamicObject::Ptr object (std::initializer_list<std::pair<juce::Identifier, juce::var>> properties);

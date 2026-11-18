@@ -13,6 +13,7 @@
 // e a ordem faixa → master segue o RealtimeEffectManager.
 
 import { channelVolumes, dbToLinear } from './buffer.js'
+import { createNativeEngine } from './engine-native.js'
 import { buildChain, chainSignature } from './realtime.js'
 import { playNote } from './synth.js'
 
@@ -179,6 +180,7 @@ function teardown (graph) {
 }
 
 class AudioEngine {
+  kind = 'web'
   ctx = null
   out = null
   analysers = []
@@ -339,4 +341,25 @@ function peakOfAnalyser (a) {
   return p
 }
 
-export const engine = new AudioEngine()
+// O app usa sempre `engine`: no navegador é o motor Web Audio; no desktop, assim
+// que o motor nativo (raven-engine) responde, as chamadas passam para ele.
+// Exportado também para os testes de paridade (motor web × nativo).
+export const webEngine = new AudioEngine()
+let current = webEngine
+
+export const engine = new Proxy({}, {
+  get (_, key) {
+    const value = current[key]
+    return typeof value === 'function' ? value.bind(current) : value
+  }
+})
+
+export const engineReady = createNativeEngine()
+  .then(native => {
+    if (native) {
+      webEngine.stop()
+      current = native
+    }
+  })
+  .catch(e => console.warn('[motor nativo] usando Web Audio:', e.message))
+  .then(() => current.kind)

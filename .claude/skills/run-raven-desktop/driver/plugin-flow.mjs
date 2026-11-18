@@ -33,7 +33,9 @@ try {
   // 1. Estado limpo
   await c.waitFor(`!!document.querySelector('.menu-bar')`, 60000)
   await c.sleep(1500)
-  await c.evaluate(`${store('ui')}.splashOpen = false`)
+  // Fecha a tela de abertura e diálogos que tenham ficado abertos de outra rodada.
+  await c.evaluate(`Object.assign(${store('ui')}, { splashOpen: false, pluginEffect: false, effect: null, audioDevicesOpen: false, aboutOpen: false })`)
+  await c.sleep(500)
   await c.evaluate(`${store('project')}.resetProject()`)
   await c.sleep(500)
   const engine = await c.evaluate('window.audio?.engineStatus()')
@@ -53,7 +55,10 @@ try {
   await c.clickText('Efeito', '.menu-bar .q-btn'); await c.sleep(400)
   await c.clickText('Plugin (VST3', '.q-menu .q-item')
   await c.waitFor(`!!document.querySelector('.plugin-card') && !document.querySelector('.plugin-card .q-linear-progress') && !document.querySelector('.q-loading')`, 300000)
-  await c.sleep(1500)
+  // O diálogo carrega sozinho o último plugin usado: espera isso antes de escolher.
+  await c.waitFor(`document.querySelector('.plugin-card .text-h6')?.innerText !== 'Plugin' && !document.querySelector('.q-loading')`, 10000)
+    .catch(() => {})
+  await c.sleep(800)
   if (await dialogText() !== 'kHs Gain') {
     const field = await c.evaluate(`(() => { const r = document.querySelector('.plugin-card .q-field').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 } })()`)
     await c.clickAt(field.x, field.y); await c.sleep(400)

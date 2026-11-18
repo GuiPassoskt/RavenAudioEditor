@@ -20,6 +20,24 @@ const SCAN_MAX_ATTEMPTS = 10 // cada queda põe um plugin na lista negra e recom
 
 const MISSING_MESSAGE = 'Motor de áudio nativo não encontrado. Compile-o com "npm run build:engine".'
 
+async function tempFile (suffix) {
+  const dir = path.join(os.tmpdir(), 'raven-engine')
+  await mkdir(dir, { recursive: true })
+  return path.join(dir, `${randomUUID()}-${suffix}.f32`)
+}
+
+// Float32 planar: um canal inteiro depois do outro (engine/src/Protocol.h).
+function writePlanar (file, channels) {
+  return writeFile(file, Buffer.concat(channels.map(ch => Buffer.from(ch.buffer, ch.byteOffset, ch.byteLength))))
+}
+
+async function readPlanar (file, numChannels, frames) {
+  const data = frames > 0 ? await readFile(file) : Buffer.alloc(0)
+  const bytes = frames * Float32Array.BYTES_PER_ELEMENT
+  return Array.from({ length: numChannels }, (_, c) =>
+    new Float32Array(data.buffer.slice(data.byteOffset + c * bytes, data.byteOffset + (c + 1) * bytes)))
+}
+
 export function findEngineBinary () {
   if (process.env.RAVEN_ENGINE_PATH) return process.env.RAVEN_ENGINE_PATH
   const dir = import.meta.env.QUASAR_DEV
@@ -49,7 +67,8 @@ export class EngineHost {
     return {
       ...process.env,
       RAVEN_PLUGIN_CACHE: path.join(this.pluginDir, 'known-plugins.xml'),
-      RAVEN_SCAN_PEDAL: path.join(this.pluginDir, 'scan-in-progress.txt')
+      RAVEN_SCAN_PEDAL: path.join(this.pluginDir, 'scan-in-progress.txt'),
+      RAVEN_AUDIO_SETTINGS: path.join(app.getPath('userData'), 'audio-settings.xml')
     }
   }
 
@@ -109,21 +128,36 @@ export class EngineHost {
 
   // Passa um trecho de áudio (Float32Array por canal) pelo plugin aberto em instanceId.
   async process (instanceId, channels, sampleRate) {
-    const dir = path.join(os.tmpdir(), 'raven-engine')
-    await mkdir(dir, { recursive: true })
-    const base = path.join(dir, randomUUID())
-    const input = `${base}-in.f32`
-    const output = `${base}-out.f32`
-    const frames = channels[0]?.length ?? 0
-
+    const input = await tempFile('in')
+    const output = await tempFile('out')
     try {
-      await writeFile(input, Buffer.concat(channels.map(ch => Buffer.from(ch.buffer, ch.byteOffset, ch.byteLength))))
-      await this.request('fx.process', { instanceId, sampleRate, channels: channels.length, frames, input, output })
-      const data = await readFile(output)
-      const bytes = frames * Float32Array.BYTES_PER_ELEMENT
-      return channels.map((_, c) => new Float32Array(data.buffer.slice(data.byteOffset + c * bytes, data.byteOffset + (c + 1) * bytes)))
+      await writePlanar(input, channels)
+      await this.request('fx.process', { instanceId, sampleRate, channels: channels.length, frames: channels[0]?.length ?? 0, input, output })
+      return readPlanar(output, channels.length, channels[0]?.length ?? 0)
     } finally {
       await rm(input, { force: true })
+      await rm(output, { force: true })
+    }
+  }
+
+  // Envia áudio ao motor (clips.load, preview.play): o arquivo vai em `file`.
+  async sendAudio (cmd, args, channels) {
+    const file = await tempFile('in')
+    try {
+      await writePlanar(file, channels)
+      return await this.request(cmd, { ...args, file, channels: channels.length, frames: channels[0]?.length ?? 0 })
+    } finally {
+      await rm(file, { force: true })
+    }
+  }
+
+  // Recebe áudio estéreo do motor (render.offline, capture.read): o motor grava em `output`.
+  async receiveAudio (cmd, args) {
+    const output = await tempFile('out')
+    try {
+      const { frames } = await this.request(cmd, { ...args, output })
+      return readPlanar(output, 2, frames)
+    } finally {
       await rm(output, { force: true })
     }
   }

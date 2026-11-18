@@ -904,9 +904,11 @@ export const useProjectStore = defineStore('project', {
       }))
     },
 
-    stopRecording () {
-      if (!rec) return
-      engine.stopCapture()
+    // Assíncrono: o motor nativo entrega o último trecho gravado ao parar.
+    async stopRecording () {
+      if (!rec || rec.stopping) return
+      rec.stopping = true
+      await engine.stopCapture()
       engine.stop()
       const { t0, length, ids, buffers } = rec
       rec = null

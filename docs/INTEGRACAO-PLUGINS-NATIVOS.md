@@ -308,7 +308,7 @@ nele em fases. A Fase 1 usa esse mesmo processo só para aplicar efeitos (Opçã
 |---|---|---|---|
 | 0 ✅ | Projeto em modo Electron (`@quasar/app-vite` v3), `npm run dev:electron` e `npm run build:electron` funcionando | Web Audio (atual) | Concluída |
 | 1 ✅ | Executável JUCE (`raven-engine`) iniciado pelo Electron, que **lista plugins** VST3/LV2 instalados e **aplica efeito em trecho** (Opção C). Testada pela interface no modo dev e no app empacotado (seção 8) | Web Audio + motor JUCE só para aplicar efeito | Concluída |
-| 2 | **Motor nativo** de reprodução e mixagem (I/O nativo, grafo, transporte). O Web Audio sai | Nativo | Alto |
+| 2 ✅ | **Motor nativo** de reprodução e mixagem (I/O nativo, grafo, transporte). O Web Audio sai do app desktop (seção 4.6) | Nativo | Concluída |
 | 3 | Plugins **em tempo real** nas cadeias de faixa e master, mais as janelas nativas dos plugins | Nativo | Médio |
 | 4 | Instrumentos virtuais (VSTi) nas faixas MIDI, MIDI I/O de hardware, gravação com compensação de latência | Nativo | Médio |
 | 5 | Recursos de DAW: automação, clips, envios/barramentos, congelar faixa, render em segundo plano | Nativo | Médio |
@@ -317,7 +317,7 @@ nele em fases. A Fase 1 usa esse mesmo processo só para aplicar efeitos (Opçã
 flowchart LR
   F0["Fase 0 ✅<br/>Electron<br/>build e instalador"]
   F1["Fase 1 ✅<br/>Motor JUCE<br/>varredura + aplicar efeito"]
-  F2["Fase 2<br/>Motor nativo<br/>I/O, grafo, transporte"]
+  F2["Fase 2 ✅<br/>Motor nativo<br/>I/O, grafo, transporte"]
   F3["Fase 3<br/>Plugins em tempo real<br/>janelas nativas"]
   F4["Fase 4<br/>VSTi, MIDI de hardware,<br/>latência de gravação"]
   F5["Fase 5<br/>DAW: automação, clips,<br/>barramentos, congelar"]
@@ -437,7 +437,7 @@ escrito à mão ou juntado de várias bibliotecas.
 
 | Necessidade | Módulo / classe do JUCE | Observação |
 |---|---|---|
-| Driver de áudio (ASIO, WASAPI, CoreAudio, ALSA, JACK) | `juce_audio_devices`: `AudioDeviceManager` | O JUCE 9 já traz o ASIO SDK 2.3; basta `-DRAVEN_ASIO=ON` (Fase 2) |
+| Driver de áudio (ASIO, WASAPI, CoreAudio, ALSA, JACK) | `juce_audio_devices`: `AudioDeviceManager` | O JUCE 9 já traz o ASIO SDK 2.3; ligado por padrão (`RAVEN_ASIO=ON`) |
 | Portas MIDI de hardware | `juce_audio_devices`: `MidiInput`, `MidiOutput` | |
 | Varredura e carga de plugins | `juce_audio_processors`: `AudioPluginFormatManager`, `KnownPluginList`, `PluginDirectoryScanner` | VST3, AU (macOS), LV2 e LADSPA (Linux). VST2 só com o SDK antigo, ver seção 7 |
 | Varredura isolada (plugin que trava não derruba o motor) | `PluginDirectoryScanner` com um processo filho de varredura | Mesmo padrão do `AudioPluginHost` de exemplo do JUCE |
@@ -596,14 +596,94 @@ permite compilar com o mesmo comando em CI e na máquina de desenvolvimento.
   plugins VST3 não preenchem `getAllValueStrings()`, o motor monta os textos com
   o `getText()` de cada passo.
 
-### 4.6 Ambiente de desenvolvimento (Windows)
+### 4.6 Fase 2: motor de áudio nativo (como está implementado)
+
+No app desktop, tocar, mixar, aplicar efeitos em tempo real, sintetizar MIDI,
+renderizar e gravar passaram para o `raven-engine`. No navegador (e no desktop,
+se o motor não existir ou não abrir o dispositivo) continua o motor Web Audio.
+As telas não mudaram: `src/audio/engine.js` exporta `engine`, que encaminha as
+chamadas para o motor nativo (`src/audio/engine-native.js`) assim que ele responde.
+
+**No motor (C++):**
+
+| Arquivo | O que faz |
+|---|---|
+| `engine/src/AudioEngine.cpp` | Dispositivo de áudio (`AudioDeviceManager`), transporte, prévia, nota avulsa, medidores (30/s), render offline, gravação e escolha de dispositivo (salva em `<userData>/audio-settings.xml`) |
+| `engine/src/MixGraph.cpp` | O mesmo grafo do `engine.js`: clipe ou sintetizador → efeitos da faixa → ganho/pan → Σ → efeitos do master → fader. Imutável: a cada mudança o motor monta outro e troca sem parar o som |
+| `engine/src/RealtimeEffects.cpp` | Os 8 efeitos em tempo real de `realtime.js` (Ganho, Graves e Agudos, Filtro, Eco, Reverb, Compressor, Limitador, Distorção), com o crossfade de liga/desliga |
+| `engine/src/Synth.cpp` | O sintetizador de `synth.js`: 16 famílias General MIDI e bateria |
+| `engine/src/Dsp.h` | Biquad com as fórmulas da especificação Web Audio, osciladores sem aliasing (PolyBLEP) e suavização de parâmetros |
+
+**Decisões:**
+
+- **Taxa do projeto ≠ taxa do dispositivo:** o projeto é mixado na taxa dele e
+  convertido para a do dispositivo (`ResamplingAudioSource`). O modo compartilhado
+  do Windows só toca na taxa do mixer do sistema (48 kHz aqui).
+- **Mudar o mix tocando não reinicia mais a reprodução** (no Web Audio, mudar a
+  estrutura de uma cadeia reiniciava). Notas soando, caudas de reverb/eco e ganhos
+  suavizados ficam em objetos que sobrevivem à troca de grafo (`TrackState`,
+  `RealtimeEffect`).
+- **Thread de áudio sem espera:** o grafo é trocado com try-lock e os objetos
+  antigos são liberados no thread de mensagens.
+- **Áudio das faixas:** continua morando na interface. Cada `Float32Array` vira
+  um "clipe" enviado uma vez ao motor (`clips.load`) e reaproveitado; clipes que
+  saem do projeto são liberados (`clips.release`) e reenviados se o desfazer os
+  trouxer de volta. As notas MIDI só vão quando a faixa muda (`notesKey`).
+- **Gravação:** a entrada abre na primeira gravação (~2 s no WASAPI, porque o
+  dispositivo inteiro reabre) e fica aberta até o app fechar: as gravações
+  seguintes começam na hora e parar é instantâneo. O indicador de microfone do
+  Windows fica aceso depois da primeira gravação. A interface lê o áudio gravado
+  a cada 100 ms, já convertido para a taxa do projeto.
+- **Entrada padrão:** é a entrada padrão do Windows (a mesma que o navegador
+  usaria). Nesta máquina é o "CABLE Output (VB-Audio Virtual Cable)", que fica em
+  silêncio; para gravar do microfone, escolha-o em **Transporte → Dispositivos de áudio…**.
+- **ASIO** ligado por padrão (`RAVEN_ASIO=ON`), com o ASIO SDK que vem no JUCE (GPLv3).
+
+**Comandos novos do protocolo:** `audio.status`, `audio.devices`,
+`audio.setDevice`, `project.sync`, `project.setRate`, `clips.load`,
+`clips.release`, `transport.play`, `transport.stop`, `preview.play`,
+`preview.stop`, `synth.audition`, `render.offline`, `capture.start`,
+`capture.read`, `capture.stop`. Eventos: `meters` (posição, picos do master,
+das faixas e da entrada) e `transport.ended`.
+
+**Paridade com o motor Web Audio** (mesmo projeto renderizado pelos dois motores
+dentro do app, diferença de RMS):
+
+| Caso | Diferença |
+|---|---|
+| Seco com ganho e pan, Ganho, Graves e Agudos, Filtros, Distorção | 0,00 dB |
+| MIDI: piano, cordas, synth lead, bateria | 0,00 a 0,02 dB |
+| Eco (com ruído) | −0,02 dB |
+| Reverb, só sinal processado (com ruído) | −0,1 dB (a resposta ao impulso é aleatória nos dois motores) |
+| Compressor / Limitador | +0,7 / +0,3 dB (detector um pouco diferente do Chromium) |
+
+Diferenças conhecidas, todas herdadas do navegador ou intencionais:
+
+- **Eco com tons puros:** o Chromium acrescenta 128 amostras (2,9 ms) no laço de
+  realimentação; o motor nativo segue a fórmula exata do `EchoBase` do Audacity.
+  Com sinais musicais a diferença não se ouve.
+- **Limitador passa do teto:** o `DynamicsCompressorNode` aplica um ganho de
+  compensação automático, e o Limitador (que é um compressor) herda isso: com teto
+  de −12 dB a saída fica em torno de −5 dB. O motor nativo reproduz o mesmo
+  comportamento para o som não mudar entre navegador e desktop. **A corrigir nos
+  dois motores.**
+- **Osciladores:** quadrada e dente de serra são normalizadas pelo pico com o
+  overshoot de Gibbs (fator 0,848), como as tabelas do navegador.
+
+**O que fica para depois:**
+
+- O áudio ainda mora na memória da interface (sem paginação em disco).
+- Plugins VST3/LV2 nas cadeias em tempo real: Fase 3.
+- Faixas com instrumentos virtuais e MIDI de hardware: Fase 4.
+
+### 4.7 Ambiente de desenvolvimento (Windows)
 
 | Ferramenta | Para quê |
 |---|---|
 | Visual Studio 2022 Build Tools, carga "Desenvolvimento para desktop com C++" | Compilador MSVC e SDK do Windows |
 | CMake 3.22 ou mais novo | Gera o projeto do motor |
 | Git | Submódulo do JUCE |
-| ASIO | Não precisa baixar: o JUCE 9 já traz o ASIO SDK 2.3 (opção GPLv3, ver seção 7). Liga com `cmake ... -DRAVEN_ASIO=ON`. Sem ele, o motor usa WASAPI |
+| ASIO | Não precisa baixar: o JUCE 9 já traz o ASIO SDK 2.3 (opção GPLv3, ver seção 7). Ligado por padrão; para desligar, `cmake ... -DRAVEN_ASIO=OFF` |
 | Ninja (opcional) | Compilação mais rápida |
 
 Python e `node-gyp` **não** são necessários nesse modelo, porque o motor não é
@@ -739,7 +819,7 @@ um addon do Node.
    mostrava 2083 parâmetros (2080 eram controladores MIDI internos do VST3).
 
    Para compilar numa máquina nova:
-   1. instalar o ambiente da [seção 4.6](#46-ambiente-de-desenvolvimento-windows);
+   1. instalar o ambiente da [seção 4.7](#47-ambiente-de-desenvolvimento-windows);
    2. depois de clonar o repositório: `git submodule update --init`;
    3. `npm run build:engine` (gera `engine/bin/raven-engine.exe`);
    4. teste rápido sem interface, no Git Bash:

@@ -46,10 +46,13 @@ export async function connect (port = 9333) {
     await clickAt(p.x, p.y)
     return p
   }
+  // Letras sem modificador precisam de "keyDown" com o texto; Ctrl+tecla e teclas
+  // especiais (Espaço, Delete…) vão como "rawKeyDown".
   const key = async (keyName, { ctrl = false, code, keyCode } = {}) => {
     const modifiers = ctrl ? 2 : 0
     const base = { key: keyName, code: code ?? keyName, modifiers, windowsVirtualKeyCode: keyCode }
-    await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base })
+    const printable = !ctrl && keyName.length === 1 && keyName !== ' '
+    await send('Input.dispatchKeyEvent', printable ? { type: 'keyDown', text: keyName, ...base } : { type: 'rawKeyDown', ...base })
     await send('Input.dispatchKeyEvent', { type: 'keyUp', ...base })
   }
   const type = text => send('Input.insertText', { text })

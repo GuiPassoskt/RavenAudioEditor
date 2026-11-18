@@ -10,6 +10,7 @@ import { useUiStore } from 'src/stores/ui'
 import { EFFECTS, GENERATORS, ANALYZERS } from 'src/audio/effects'
 import { pickFiles } from 'src/audio/fileio'
 import { hasNativeEngine } from 'src/audio/plugins'
+import { engineReady } from 'src/audio/engine'
 
 export function notifyError (e) {
   Notify.create({ type: 'negative', message: e?.message ?? String(e), position: 'bottom', timeout: 3500 })
@@ -139,6 +140,13 @@ export function useCommands () {
     skipStart: { label: 'Ir para o início', icon: 'skip_previous', keys: 'Home', run: () => p.skipToStart() },
     skipEnd: { label: 'Ir para o fim', icon: 'skip_next', keys: 'End', run: () => p.skipToEnd() },
     loop: { label: 'Repetir seleção (loop)', icon: 'repeat', keys: 'L', run: () => { p.loop = !p.loop } },
+    audioDevices: {
+      label: 'Dispositivos de áudio…', icon: 'speaker',
+      run: async () => {
+        if (await engineReady !== 'native') throw new Error('O motor de áudio nativo não está disponível; o app está usando a Web Audio API.')
+        ui.audioDevicesOpen = true
+      }
+    },
 
     // Ferramentas
     toolSelect: { label: 'Ferramenta de seleção', icon: 'mdi-cursor-text', keys: 'F1', run: () => { p.tool = 'select' } },
@@ -198,7 +206,7 @@ export function useCommands () {
     { label: 'Editar', items: ['undo', 'redo', '-', 'cut', 'copy', 'paste', 'remove', '-', 'duplicate', 'silence', 'trim', 'splitNew', '-', 'history'] },
     { label: 'Selecionar', items: ['selectAll', 'selectNone', 'selectAllTracks', '-', 'selectStartToCursor', 'selectCursorToEnd'] },
     { label: 'Exibir', items: ['zoomIn', 'zoomNormal', 'zoomOut', 'zoomSel', 'zoomFit', '-', 'mixer', 'pianoRoll', 'history'] },
-    { label: 'Transporte', items: ['playStop', 'pause', 'stop', 'record', '-', 'skipStart', 'skipEnd', 'loop'] },
+    { label: 'Transporte', items: ['playStop', 'pause', 'stop', 'record', '-', 'skipStart', 'skipEnd', 'loop', ...(hasNativeEngine ? ['-', 'audioDevices'] : [])] },
     { label: 'Faixas', items: ['newMono', 'newStereo', 'newMidi', '-', 'pianoRoll', 'renderMidi', '-', 'mixRender', 'stereoToMono', '-', 'removeTracks'] },
     { label: 'Gerar', items: GENERATORS.map(d => `gen:${d.id}`) },
     { label: 'Efeito', items: ['trackEffects', 'masterEffects', ...(hasNativeEngine ? ['-', 'pluginEffect'] : []), '-', ...EFFECTS.map(d => `fx:${d.id}`)] },

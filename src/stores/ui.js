@@ -5,6 +5,7 @@ export const useUiStore = defineStore('ui', {
   state: () => ({
     effect: null, // { def, kind: 'effect' | 'generate' }
     pluginEffect: false, // diálogo de plugin nativo (VST3/LV2), só no desktop
+    audioDevicesOpen: false, // dispositivos de áudio do motor nativo, só no desktop
     analysis: null, // 'spectrum' | 'clipping' | 'stats'
     historyOpen: false,
     mixerOpen: false, // Mesa de som (MixerBoard)
