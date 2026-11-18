@@ -14,15 +14,21 @@
 // (src/tracks/playabletrack/wavetrack/ui/WaveformView.cpp): para cada coluna de
 // pixel desenha min/max (cor forte) e RMS (cor clara); com zoom alto passa a
 // ligar as amostras individuais e, mais perto ainda, a mostrar pontos.
+//
+// Com a ferramenta de envelope (F3), edita a automação de volume ou pan da faixa
+// como o EnvelopeHandle do Audacity: clicar cria um ponto, arrastar move, duplo
+// clique remove.
 
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useProjectStore } from 'src/stores/project'
+import { isFrozen, useProjectStore } from 'src/stores/project'
+import { AUTOMATION_PARAMS, envelopeAt, hasAutomation } from 'src/audio/automation'
 import { rangeStats } from 'src/audio/summary'
 import { trackDuration } from 'src/audio/engine'
 import { useUiStore } from 'src/stores/ui'
 import { rgba, shade, textOn } from 'src/audio/colors'
 
 const CLIP_HEADER = 15 // faixa de título do clip, como nas DAWs
+const ENVELOPE_HIT = 8 // px: distância para pegar um ponto do envelope
 
 const props = defineProps({
   track: { type: Object, required: true },
@@ -74,7 +80,8 @@ function draw () {
   g.fillStyle = colors.bg
   g.fillRect(0, 0, w, h)
   const isMidi = track.kind === 'midi'
-  const len = isMidi ? 0 : track.channels[0].length
+  const isBus = track.kind === 'bus'
+  const len = track.kind === 'audio' ? track.channels[0].length : 0
   const rawX0 = xOf(track.offset)
   const rawX1 = xOf(track.offset + trackDuration(track, rate))
   const clipX0 = Math.max(0, rawX0)
@@ -98,9 +105,22 @@ function draw () {
     g.fillStyle = textOn(color)
     g.font = '600 11px Roboto, sans-serif'
     g.textBaseline = 'middle'
-    g.fillText(track.name, Math.max(x, 0) + 6, 2 + CLIP_HEADER / 2 + 0.5)
+    g.fillText(isFrozen(track) ? `❄ ${track.name} (congelada)` : track.name, Math.max(x, 0) + 6, 2 + CLIP_HEADER / 2 + 0.5)
     g.textBaseline = 'alphabetic'
+    // Congelada: um véu frio sobre o clipe.
+    if (isFrozen(track)) {
+      g.fillStyle = 'rgba(160, 210, 255, 0.10)'
+      g.fillRect(x, 2 + CLIP_HEADER, cw, h - 4 - CLIP_HEADER)
+    }
     g.restore()
+  }
+  if (isBus) {
+    g.fillStyle = rgba(color, 0.12)
+    g.fillRect(0, 2, w, h - 4)
+    g.fillStyle = rgba(color, 0.85)
+    g.font = '11px Roboto, sans-serif'
+    const from = store.tracks.filter(t => t.sends?.some(s => s.bus === track.id)).length
+    g.fillText(`Barramento — recebe ${from === 1 ? '1 envio' : from + ' envios'}. Efeitos e volume do barramento valem para todos.`, 10, 18)
   }
   // Área útil do conteúdo (abaixo da faixa de título).
   const top0 = hasClip ? CLIP_HEADER + 4 : 0
@@ -121,7 +141,7 @@ function draw () {
 
   if (isMidi) drawNotes(g, w, top0, contentH, xOf, color, clipX0, clipX1)
 
-  const nCh = track.channels.length
+  const nCh = Math.max(1, track.channels.length)
   const laneH = contentH / nCh
   const spp = rate / pps // amostras por pixel
 
@@ -185,6 +205,16 @@ function draw () {
     }
   })
 
+  // Automação: a linha do parâmetro escolhido com a ferramenta de envelope; fora
+  // dela, as linhas que existirem, mais apagadas.
+  const envTop = isBus ? 26 : CLIP_HEADER + 4
+  const envH = h - envTop - 3
+  const editing = store.tool === 'envelope'
+  for (const param of ['gain', 'pan']) {
+    const active = editing && ui.envelopeParam === param
+    if (active || track.automation?.[param]?.length) drawEnvelope(g, w, envTop, envH, xOf, param, active)
+  }
+
   // Gravação em curso nesta faixa: trecho desenhado ao vivo, em vermelho.
   if (store.recTake?.ids.includes(track.id)) drawRecording(g, w, h, xOf)
 
@@ -198,6 +228,56 @@ function draw () {
       g.setLineDash([])
     }
   }
+}
+
+// Valor do parâmetro <-> altura na área do envelope.
+function envelopeY (param, v, top, h) {
+  const { min, max } = AUTOMATION_PARAMS[param]
+  return top + ((max - v) / (max - min)) * h
+}
+function envelopeValue (param, y, top, h) {
+  const { min, max } = AUTOMATION_PARAMS[param]
+  const v = max - ((y - top) / h) * (max - min)
+  return param === 'gain' ? Math.round(v * 10) / 10 : Math.round(v * 100) / 100
+}
+
+function drawEnvelope (g, w, top, h, xOf, param, active) {
+  const track = props.track
+  const points = track.automation?.[param] ?? []
+  const color = param === 'gain' ? '#ffd166' : '#5ee0c8'
+  g.save()
+  g.globalAlpha = active ? 1 : 0.55
+  g.strokeStyle = color
+  g.lineWidth = active ? 1.5 : 1
+  if (!points.length) {
+    // Sem pontos: a linha neutra (0 dB, ou o pan da faixa), tracejada.
+    const y = envelopeY(param, AUTOMATION_PARAMS[param].neutral(track), top, h)
+    g.setLineDash([4, 4])
+    g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke()
+    g.setLineDash([])
+  } else {
+    g.beginPath()
+    const x0 = Math.max(0, xOf(track.offset + points[0].t))
+    g.moveTo(0, envelopeY(param, points[0].v, top, h))
+    for (const p of points) g.lineTo(xOf(track.offset + p.t), envelopeY(param, p.v, top, h))
+    g.lineTo(w, envelopeY(param, points[points.length - 1].v, top, h))
+    g.stroke()
+    if (active) {
+      g.fillStyle = color
+      for (const p of points) {
+        const x = xOf(track.offset + p.t)
+        if (x < x0 - 6 || x > w + 6) continue
+        g.beginPath(); g.arc(x, envelopeY(param, p.v, top, h), 3.5, 0, Math.PI * 2); g.fill()
+      }
+    }
+  }
+  if (active) {
+    g.fillStyle = color
+    g.font = '10px Roboto, sans-serif'
+    const label = param === 'gain' ? 'Volume (dB, somado ao fader)' : 'Pan (D em cima, E embaixo)'
+    g.fillText(label, w - g.measureText(label).width - 8, top + 11)
+  }
+  g.restore()
 }
 
 function drawRecording (g, w, h, xOf) {
@@ -288,11 +368,79 @@ function trackIdAtPoint (x, y) {
   return el ? Number(el.dataset.trackId) : null
 }
 
+// Área do envelope e pontos em pixels, para achar o ponto sob o mouse.
+function envelopeGeometry () {
+  const track = props.track
+  const rect = canvas.value.getBoundingClientRect()
+  const top = track.kind === 'bus' ? 26 : CLIP_HEADER + 4
+  const h = props.height - top - 3
+  const param = ui.envelopeParam
+  const points = [...(track.automation?.[param] ?? [])]
+  const xOf = t => (track.offset + t - store.scrollTime) * store.pps
+  return { rect, top, h, param, points, xOf }
+}
+
+function nearestPoint ({ rect, top, h, param, points, xOf }, e) {
+  let best = -1
+  let bestD = ENVELOPE_HIT
+  points.forEach((p, i) => {
+    const d = Math.hypot(xOf(p.t) - (e.clientX - rect.left), envelopeY(param, p.v, top, h) - (e.clientY - rect.top))
+    if (d <= bestD) { best = i; bestD = d }
+  })
+  return best
+}
+
+function onEnvelopeDown (e) {
+  const track = props.track
+  store.selectTrack(track.id)
+  const geo = envelopeGeometry()
+  const { rect, top, h, param } = geo
+  const local = ev => ({
+    t: Math.max(0, store.scrollTime + (ev.clientX - rect.left) / store.pps - track.offset),
+    v: envelopeValue(param, Math.max(top, Math.min(top + h, ev.clientY - rect.top)), top, h)
+  })
+  let points = geo.points.map(p => ({ ...p })) // os pontos do store estão no histórico: não mexer neles
+  let i = nearestPoint(geo, e)
+  const created = i < 0
+  if (created) {
+    // Ponto novo onde se clicou. Numa linha vazia, ou clicando em cima da linha,
+    // ele nasce no valor da linha (o som não muda até arrastar).
+    const p = local(e)
+    if (!points.length) p.v = AUTOMATION_PARAMS[param].neutral(track)
+    else if (Math.abs(envelopeY(param, envelopeAt(points, p.t), top, h) - (e.clientY - rect.top)) <= ENVELOPE_HIT) p.v = Math.round(envelopeAt(points, p.t) * 100) / 100
+    points = [...points, p]
+    i = points.length - 1
+  }
+  const dragged = points[i]
+  let changed = created
+  const update = p => {
+    points = points.map(x => (x === dragged ? Object.assign(dragged, p) : x))
+    store.setAutomation(track.id, param, points.map(x => ({ ...x })))
+  }
+  if (created) update({})
+  const onMove = ev => {
+    changed = true
+    update(local(ev))
+  }
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove)
+    window.removeEventListener('pointerup', onUp)
+    if (changed) store.commitAutomation(param)
+  }
+  window.addEventListener('pointermove', onMove)
+  window.addEventListener('pointerup', onUp)
+}
+
 function onPointerDown (e) {
   if (e.button !== 0) return
   const track = props.track
   const t = timeAt(e.clientX)
   let onMove
+
+  if (store.tool === 'envelope') {
+    onEnvelopeDown(e)
+    return
+  }
 
   if (store.tool === 'shift') {
     const startX = e.clientX
@@ -339,8 +487,16 @@ function onPointerDown (e) {
   window.addEventListener('pointerup', onUp)
 }
 
-function onDoubleClick () {
+function onDoubleClick (e) {
   const t = props.track
+  if (store.tool === 'envelope') {
+    // Duplo clique num ponto remove o ponto.
+    const geo = envelopeGeometry()
+    const i = nearestPoint(geo, e)
+    if (i >= 0) store.setAutomation(t.id, geo.param, geo.points.filter((_, k) => k !== i), 'Ponto de automação removido')
+    return
+  }
+  if (t.kind === 'bus') return
   if (t.kind === 'midi') { store.selectTrack(t.id); ui.pianoRoll = t.id; return }
   store.selectTrack(t.id)
   store.setSelection(t.offset, store.trackEnd(t))
@@ -348,6 +504,8 @@ function onDoubleClick () {
 
 watch(
   () => [props.track.version, props.track.offset, props.track.selected, props.track.channels, props.track.notes, props.track.color, props.track.name, store.recTake,
+    props.track.automation, props.track.frozen, props.track.effects, props.track.pan, store.tool, ui.envelopeParam,
+    props.track.kind === 'bus' && store.tracks.map(t => t.sends),
     store.pps, store.scrollTime, store.sel.t0, store.sel.t1, store.rate, props.height],
   scheduleDraw
 )
@@ -368,4 +526,5 @@ onBeforeUnmount(() => {
 .wave-canvas { display: block; width: 100%; touch-action: none; }
 .tool-select { cursor: text; }
 .tool-shift { cursor: ew-resize; }
+.tool-envelope { cursor: crosshair; }
 </style>

@@ -3,7 +3,7 @@
     <div class="track-header" :style="{ width: headerWidth + 'px', height: height + 'px' }" @pointerdown.self="select">
       <div class="row items-center no-wrap q-gutter-x-xs">
         <button type="button" class="track-icon" :title="`Cor da faixa: ${colorName}`">
-          <q-icon :name="track.kind === 'midi' ? (track.drum ? 'mdi-instrument-triangle' : 'mdi-piano') : 'graphic_eq'" size="16px" />
+          <q-icon :name="icon" size="16px" />
           <q-menu dark anchor="bottom left" self="top left">
             <div class="swatches q-pa-sm">
               <div class="text-caption text-grey-5 q-mb-xs">Cor da faixa</div>
@@ -25,6 +25,11 @@
           </q-popup-edit>
         </div>
         <q-btn
+          v-if="track.kind !== 'bus'" flat dense round size="xs" icon="mdi-snowflake" :color="frozen ? 'light-blue-3' : 'grey-7'"
+          :title="frozen ? 'Congelada: toca o áudio pré-renderizado. Clique para descongelar' : 'Congelar faixa (renderiza instrumento e efeitos para aliviar o processador)'"
+          @click="toggleFreeze"
+        />
+        <q-btn
           flat dense round size="xs" icon="mdi-tune-vertical" :color="activeFx ? 'positive' : 'grey-5'"
           :title="`Efeitos em tempo real (${track.effects.length})`" @click="ui.fxTarget = track.id"
         >
@@ -37,7 +42,16 @@
               <q-item v-close-popup clickable @click="store.moveTrack(track.id, 1)"><q-item-section>Mover para baixo</q-item-section></q-item>
               <q-separator dark />
               <q-item v-close-popup clickable @click="selectWhole"><q-item-section>Selecionar faixa inteira</q-item-section></q-item>
-              <q-item v-close-popup clickable @click="ui.fxTarget = track.id"><q-item-section>Efeitos em tempo real…</q-item-section></q-item>
+              <q-item v-close-popup clickable @click="ui.fxTarget = track.id"><q-item-section>Efeitos em tempo real e envios…</q-item-section></q-item>
+              <q-item v-if="track.kind !== 'bus'" v-close-popup clickable @click="toggleFreeze">
+                <q-item-section>{{ frozen ? 'Descongelar faixa' : 'Congelar faixa' }}</q-item-section>
+              </q-item>
+              <q-item v-if="track.automation?.gain?.length" v-close-popup clickable @click="store.clearAutomation(track.id, 'gain')">
+                <q-item-section>Remover automação de volume</q-item-section>
+              </q-item>
+              <q-item v-if="track.automation?.pan?.length" v-close-popup clickable @click="store.clearAutomation(track.id, 'pan')">
+                <q-item-section>Remover automação de pan</q-item-section>
+              </q-item>
               <q-separator dark />
               <q-item>
                 <q-item-section>
@@ -102,6 +116,9 @@
         />
         <q-btn flat dense size="sm" icon="mdi-piano" color="positive" title="Abrir no piano roll (F7)" @click="ui.pianoRoll = track.id" />
       </div>
+      <div v-else-if="track.kind === 'bus'" class="track-info" @pointerdown="select">
+        Barramento · {{ receives === 1 ? '1 envio' : receives + ' envios' }}
+      </div>
       <div v-else class="track-info" @pointerdown="select">
         {{ track.channels.length > 1 ? 'Estéreo' : 'Mono' }}, {{ store.rate }} Hz · 32-bit float
       </div>
@@ -114,10 +131,11 @@
 
 <script setup>
 import { computed } from 'vue'
-import { useProjectStore } from 'src/stores/project'
+import { isFrozen, useProjectStore } from 'src/stores/project'
 import { useUiStore } from 'src/stores/ui'
 import { useInstrumentChoice } from 'src/composables/instruments'
 import { TRACK_COLORS, rgba, shade } from 'src/audio/colors'
+import { guard } from 'src/composables/commands'
 import WaveformCanvas from './WaveformCanvas.vue'
 
 const props = defineProps({
@@ -131,6 +149,15 @@ const { instrumentValue, instrumentOptions, chooseInstrument, openInstrument } =
 const ui = useUiStore()
 const activeFx = computed(() => props.track.effects.some(e => e.enabled))
 const isRec = computed(() => !!store.recTake?.ids.includes(props.track.id))
+const frozen = computed(() => isFrozen(props.track))
+const receives = computed(() => store.tracks.filter(t => t.sends?.some(s => s.bus === props.track.id)).length)
+const icon = computed(() => {
+  const t = props.track
+  if (t.kind === 'bus') return 'mdi-call-merge'
+  if (t.kind === 'midi') return t.drum ? 'mdi-instrument-triangle' : 'mdi-piano'
+  return 'graphic_eq'
+})
+const toggleFreeze = () => guard(() => (frozen.value ? store.unfreezeTrack(props.track.id) : store.freezeTrack(props.track.id)), { loading: !frozen.value })
 const colorName = computed(() => TRACK_COLORS.find(c => c.value === props.track.color)?.name ?? props.track.color)
 // A cor da faixa vira variáveis CSS usadas no cabeçalho.
 const colorVars = computed(() => {

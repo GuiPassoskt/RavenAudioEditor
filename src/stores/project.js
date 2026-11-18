@@ -8,6 +8,9 @@
 //   play / pause / record   -> src/ProjectAudioManager.cpp + lib-audio-io (AudioIO)
 //   track.effects / master  -> lib-realtime-effects (RealtimeEffectList por faixa e do projeto)
 //   kind: 'midi' + notes    -> lib-note-track (NoteTrack sobre Alg_seq do Allegro)
+//   kind: 'bus' + sends     -> barramentos (aux) das DAWs: recebem envios das faixas
+//   automation              -> lib-wave-track Envelope (volume) e automação de pan
+//   frozen                  -> "congelar faixa" das DAWs: áudio pré-renderizado da cadeia
 
 import { defineStore } from 'pinia'
 import { markRaw, toRaw } from 'vue'
@@ -20,6 +23,10 @@ import { decodeProject, download, encodeProject, encodeWav } from 'src/audio/fil
 import { parseMidi, writeMidi } from 'src/audio/midifile'
 import * as N from 'src/audio/notes'
 import { effectName, realtimeDefaults } from 'src/audio/realtime'
+import {
+  AUTOMATION_PARAMS, EMPTY_AUTOMATION, hasAutomation, insertAutomationGap,
+  removeAutomationRange, shiftAutomation, trimAutomation
+} from 'src/audio/automation'
 import { nextTrackColor } from 'src/audio/colors'
 
 const HISTORY_LIMIT = 200
@@ -29,27 +36,34 @@ let clipboard = null
 let rafId = 0
 let rec = null
 let nextFxUid = 1
-let nextStateVersion = 1
+let nextStateVersion = 1 // versão do estado de plugins: o motor nativo só recebe o estado quando ela muda
 const MIDI_RECORD_LIMIT = 600 // a gravação MIDI toca o projeto por até 10 min (até parar)
 
 // Ajuste manual da compensação de latência da gravação (ms), no diálogo de dispositivos.
 export const RECORDING_LATENCY_KEY = 'raven.rec.latencyAdjustMs'
 function recordingLatencyAdjust () {
   try { return Number(localStorage.getItem(RECORDING_LATENCY_KEY)) || 0 } catch { return 0 }
-} // versão do estado de plugins: o motor nativo só recebe o estado quando ela muda
+}
+
+const FREEZE_TAIL = 2 // segundos renderizados além do fim da faixa (reverb, release das notas)
+const SEND_DEFAULT_DB = -6
 
 const zeros = n => new Float32Array(Math.max(0, n))
 export const isMidi = t => t.kind === 'midi'
-const isAudio = t => t.kind !== 'midi'
+export const isBus = t => t.kind === 'bus'
+const isAudio = t => t.kind === 'audio'
+
+const automationCopy = a => ({ gain: [...(a?.gain ?? [])], pan: [...(a?.pan ?? [])] })
 
 function makeTrack (props) {
   const midi = props.kind === 'midi'
+  const bus = props.kind === 'bus'
   return {
     id: nextId++,
-    kind: midi ? 'midi' : 'audio',
-    name: props.name ?? (midi ? 'Faixa MIDI' : 'Faixa de áudio'),
+    kind: midi || bus ? props.kind : 'audio',
+    name: props.name ?? (midi ? 'Faixa MIDI' : bus ? 'Barramento' : 'Faixa de áudio'),
     color: props.color ?? nextTrackColor(),
-    channels: markRaw(midi ? [] : props.channels),
+    channels: markRaw(midi || bus ? [] : props.channels),
     notes: markRaw(midi ? N.sortNotes([...(props.notes ?? [])]) : []),
     length: midi ? N.notesEnd(props.notes ?? []) : 0,
     program: props.program ?? 0,
@@ -62,6 +76,9 @@ function makeTrack (props) {
     selected: props.selected ?? false,
     effects: (props.effects ?? []).map(newEffectState),
     instrument: midi && props.instrument ? newInstrumentState(props.instrument) : null,
+    sends: bus ? [] : (props.sends ?? []).map(s => ({ bus: s.bus, level: s.level })), // { bus: id, level: dB }, pós-fader
+    automation: automationCopy(props.automation),
+    frozen: null, // ver freezeTrack()
     collapsed: false,
     version: version++
   }
@@ -86,6 +103,22 @@ function setChannels (track, channels) {
   track.channels = markRaw(channels)
   track.version = version++
 }
+
+// Congelada: o motor toca o áudio pré-renderizado no lugar da cadeia (instrumento
+// e efeitos). Vale enquanto o que foi renderizado não mudar; editar a faixa
+// descongela sozinho (o desfazer volta ao estado congelado).
+export function isFrozen (t) {
+  const f = t.frozen
+  return !!f && toRaw(t.channels) === f.channelsRef && toRaw(t.notes) === f.notesRef &&
+    toRaw(t.effects) === f.effectsRef && toRaw(t.instrument) === f.instrumentRef &&
+    t.program === f.program && t.drum === f.drum
+}
+
+// O que o motor recebe no lugar da faixa congelada: uma faixa de áudio sem cadeia,
+// com o mesmo ganho, pan, automação e envios.
+const engineView = t => (isFrozen(t)
+  ? { ...toRaw(t), kind: 'audio', channels: t.frozen.channels, notes: [], effects: [], instrument: null }
+  : t)
 
 function setNotes (track, notes) {
   track.notes = markRaw(N.sortNotes([...notes]))
@@ -124,13 +157,17 @@ export const useProjectStore = defineStore('project', {
   getters: {
     duration: s => s.tracks.reduce((m, t) => Math.max(m, t.offset + trackDuration(t, s.rate)), 0),
     midiTracks: s => s.tracks.filter(isMidi),
+    buses: s => s.tracks.filter(isBus),
+    // Faixas como o motor deve tocá-las (as congeladas viram áudio).
+    engineTracks: s => s.tracks.map(engineView),
     selectedTracks: s => s.tracks.filter(t => t.selected),
     hasSelection: s => s.sel.t1 - s.sel.t0 > 1e-9,
     canUndo: s => s.historyIndex > 0,
     canRedo: s => s.historyIndex < s.history.length - 1,
     dirty: s => s.historyIndex !== s.savedIndex,
+    // A mixagem precisa do grafo do motor (e não de uma soma simples das faixas).
     hasRealtime: s => s.master.gain !== 0 || s.master.effects.some(e => e.enabled) ||
-      s.tracks.some(t => t.effects.some(e => e.enabled)),
+      s.tracks.some(t => t.effects.some(e => e.enabled) || isBus(t) || t.sends.length || hasAutomation(t)),
     viewSeconds: s => s.viewWidth / s.pps
   },
 
@@ -168,13 +205,20 @@ export const useProjectStore = defineStore('project', {
 
     // Remove [t0, t1) e puxa o restante para a esquerda (como WaveTrack::Clear).
     deleteRange (track, t0, t1) {
+      if (isBus(track)) return
       if (isMidi(track)) {
         const a = Math.max(0, t0 - track.offset)
         const b = Math.max(0, t1 - track.offset)
-        if (b > a) setNotes(track, N.removeRange(track.notes, a, b))
+        if (b > a) {
+          setNotes(track, N.removeRange(track.notes, a, b))
+          track.automation = removeAutomationRange(track.automation, a, b)
+        }
       } else {
         const [s0, s1] = this.clampedRange(track, t0, t1)
-        if (s1 > s0) setChannels(track, track.channels.map(ch => removeRange(ch, s0, s1)))
+        if (s1 > s0) {
+          setChannels(track, track.channels.map(ch => removeRange(ch, s0, s1)))
+          track.automation = removeAutomationRange(track.automation, s0 / this.rate, s1 / this.rate)
+        }
       }
       if (t1 <= track.offset) track.offset -= (t1 - t0)
       else if (t0 < track.offset) track.offset = t0
@@ -188,10 +232,12 @@ export const useProjectStore = defineStore('project', {
         let notes = track.notes
         if (!notes.length) { track.offset = t; local = 0 } else if (local < 0) {
           notes = notes.map(n => ({ ...n, start: n.start - local }))
+          track.automation = shiftAutomation(track.automation, -local)
           track.offset = t
           local = 0
         }
         setNotes(track, N.insertNotes(notes, local, clip.notes, clip.duration))
+        track.automation = insertAutomationGap(track.automation, local, clip.duration)
         return
       }
       const data = fitChannels(clip.channels, track.channels.length)
@@ -199,6 +245,7 @@ export const useProjectStore = defineStore('project', {
       let channels = track.channels
       if (s < 0) {
         channels = channels.map(ch => concat([zeros(-s), ch]))
+        track.automation = shiftAutomation(track.automation, -s / this.rate)
         track.offset = t
         s = 0
       }
@@ -207,6 +254,7 @@ export const useProjectStore = defineStore('project', {
         s = 0
       }
       setChannels(track, channels.map((ch, c) => insertAt(ch, s, data[c])))
+      track.automation = insertAutomationGap(track.automation, s / this.rate, data[0].length / this.rate)
     },
 
     silenceRange (track, t0, t1) {
@@ -221,13 +269,16 @@ export const useProjectStore = defineStore('project', {
     trimRange (track, t0, t1) {
       if (isMidi(track)) {
         const a = Math.max(0, t0 - track.offset)
-        setNotes(track, N.clipNotes(track.notes, a, Math.max(a, t1 - track.offset)))
+        const b = Math.max(a, t1 - track.offset)
+        setNotes(track, N.clipNotes(track.notes, a, b))
+        track.automation = trimAutomation(track.automation, a, b)
         track.offset += a
         return
       }
       const [s0, s1] = this.clampedRange(track, t0, t1)
       track.offset += s0 / this.rate
       setChannels(track, track.channels.map(ch => ch.slice(s0, s1)))
+      track.automation = trimAutomation(track.automation, s0 / this.rate, s1 / this.rate)
     },
 
     regionOf (track) {
@@ -359,7 +410,13 @@ export const useProjectStore = defineStore('project', {
       this.name = p.name
       this.rate = p.rate
       this.tempo = p.tempo ?? 120
-      for (const t of p.tracks) this.addTrack(t)
+      // Envios vêm com a posição do barramento no arquivo; viram ids.
+      const added = p.tracks.map(t => this.addTrack({ ...t, sends: [] }))
+      p.tracks.forEach((t, i) => {
+        added[i].sends = (t.sends ?? [])
+          .filter(s => added[s.bus]?.kind === 'bus')
+          .map(s => ({ bus: added[s.bus].id, level: s.level }))
+      })
       if (p.master) this.master = { gain: p.master.gain ?? 0, effects: (p.master.effects ?? []).map(newEffectState) }
       this.history = []
       this.historyIndex = -1
@@ -368,20 +425,26 @@ export const useProjectStore = defineStore('project', {
       this.zoomFit()
     },
 
-    async exportWav ({ scope = 'all', format = 'pcm16' } = {}) {
-      const anySolo = this.tracks.some(t => t.solo)
-      let tracks = this.tracks.filter(t => !t.mute && (!anySolo || t.solo))
+    // onProgress (0..1) e signal (AbortController): a exportação roda em segundo
+    // plano, com o projeto como estava ao começar; dá para continuar editando.
+    async exportWav ({ scope = 'all', format = 'pcm16', onProgress, signal } = {}) {
+      const anySolo = this.tracks.some(t => t.solo && !isBus(t))
+      let tracks = this.engineTracks.filter(t => !isBus(t) && !t.mute && (!anySolo || t.solo))
       if (scope === 'selection') tracks = tracks.filter(t => t.selected)
       if (!tracks.length) throw new Error('Não há faixas audíveis para exportar.')
       const [t0, t1] = scope === 'selection' && this.hasSelection
         ? [this.sel.t0, this.sel.t1]
         : [0, Math.max(...tracks.map(t => this.trackEnd(t)))]
-      // Com efeitos em tempo real ou MIDI a mixagem passa pelo mesmo grafo da
-      // reprodução (como o Mixer do Audacity aplica os EffectStage na exportação).
+      // Com efeitos em tempo real, MIDI, barramentos ou automação a mixagem passa
+      // pelo mesmo grafo da reprodução (como o Mixer do Audacity aplica os
+      // EffectStage na exportação). O grafo cuida de mudo e solo; os barramentos vão juntos.
       const useGraph = this.hasRealtime || tracks.some(isMidi)
       const stereo = useGraph || tracks.some(t => t.channels.length > 1 || t.pan !== 0)
+      const graphTracks = scope === 'selection'
+        ? this.engineTracks.filter(t => isBus(t) || (t.selected && tracks.some(x => x.id === t.id)))
+        : this.engineTracks
       const mix = useGraph
-        ? await engine.render({ tracks, rate: this.rate, t0, t1, master: this.master, channels: stereo ? 2 : 1 })
+        ? await engine.render({ tracks: graphTracks, rate: this.rate, t0, t1, master: this.master, channels: stereo ? 2 : 1, onProgress, signal })
         : mixdown(tracks, this.rate, t0, t1, stereo ? 2 : 1)
       const suffix = scope === 'selection' ? '-selecao' : ''
       download(encodeWav(mix, this.rate, format), `${this.name}${suffix}.wav`)
@@ -421,13 +484,20 @@ export const useProjectStore = defineStore('project', {
       return targets
     },
 
+    // Edição de tempo (recortar, colar, silenciar…): barramentos não têm conteúdo.
+    requireEditTargets () {
+      const targets = this.requireTargets().filter(t => !isBus(t))
+      if (!targets.length) throw new Error('Barramentos não têm áudio para editar. Selecione faixas de áudio ou MIDI.')
+      return targets
+    },
+
     requireTimeSelection () {
       if (!this.hasSelection) throw new Error('Selecione um trecho de áudio primeiro.')
     },
 
     copy () {
       this.requireTimeSelection()
-      const targets = this.requireTargets()
+      const targets = this.requireEditTargets()
       clipboard = {
         duration: this.sel.t1 - this.sel.t0,
         tracks: targets.map(t => ({ name: t.name, clip: this.extract(t, this.sel.t0, this.sel.t1) }))
@@ -437,14 +507,14 @@ export const useProjectStore = defineStore('project', {
 
     cut () {
       this.copy()
-      for (const t of this.selectedTracks) this.deleteRange(t, this.sel.t0, this.sel.t1)
+      for (const t of this.requireEditTargets()) this.deleteRange(t, this.sel.t0, this.sel.t1)
       this.setSelection(this.sel.t0, this.sel.t0)
       this.pushState('Recortar')
     },
 
     remove () {
       this.requireTimeSelection()
-      for (const t of this.requireTargets()) this.deleteRange(t, this.sel.t0, this.sel.t1)
+      for (const t of this.requireEditTargets()) this.deleteRange(t, this.sel.t0, this.sel.t1)
       this.setSelection(this.sel.t0, this.sel.t0)
       this.pushState('Excluir')
     },
@@ -452,7 +522,7 @@ export const useProjectStore = defineStore('project', {
     paste () {
       if (!clipboard) throw new Error('A área de transferência está vazia.')
       const { t0, t1 } = this.sel
-      const targets = this.selectedTracks
+      const targets = this.selectedTracks.filter(t => !isBus(t))
       clipboard.tracks.forEach(({ name, clip }, i) => {
         const target = targets[i]
         // Sem faixa de destino, ou de outro tipo (áudio x MIDI): cria uma faixa nova.
@@ -468,33 +538,33 @@ export const useProjectStore = defineStore('project', {
     },
 
     duplicate () {
-      const targets = this.requireTargets()
+      const targets = this.requireEditTargets()
       for (const t of targets) {
         t.selected = false
         const [clip, offset] = this.hasSelection
           ? [this.extract(t, this.sel.t0, this.sel.t1), this.sel.t0]
-          : [{ kind: t.kind, channels: t.channels, notes: t.notes, program: t.program, drum: t.drum }, t.offset]
-        this.addTrack({ ...clip, name: `${t.name} (cópia)`, offset, gain: t.gain, pan: t.pan, color: t.color, selected: true })
+          : [{ kind: t.kind, channels: t.channels, notes: t.notes, program: t.program, drum: t.drum, automation: t.automation }, t.offset]
+        this.addTrack({ ...clip, name: `${t.name} (cópia)`, offset, gain: t.gain, pan: t.pan, color: t.color, sends: t.sends, selected: true })
       }
       this.pushState('Duplicar')
     },
 
     silence () {
       this.requireTimeSelection()
-      for (const t of this.requireTargets()) this.silenceRange(t, this.sel.t0, this.sel.t1)
+      for (const t of this.requireEditTargets()) this.silenceRange(t, this.sel.t0, this.sel.t1)
       this.pushState('Silenciar áudio')
     },
 
     trim () {
       this.requireTimeSelection()
-      for (const t of this.requireTargets()) this.trimRange(t, this.sel.t0, this.sel.t1)
+      for (const t of this.requireEditTargets()) this.trimRange(t, this.sel.t0, this.sel.t1)
       this.pushState('Aparar áudio')
     },
 
     // "Split New": move a seleção para uma nova faixa, deixando um vão no original.
     splitNew () {
       this.requireTimeSelection()
-      for (const t of this.requireTargets()) {
+      for (const t of this.requireEditTargets()) {
         const clip = this.extract(t, this.sel.t0, this.sel.t1)
         this.silenceRange(t, this.sel.t0, this.sel.t1)
         t.selected = false
@@ -507,12 +577,21 @@ export const useProjectStore = defineStore('project', {
     removeTrack (id) {
       const t = this.findTrack(id)
       this.tracks = this.tracks.filter(x => x.id !== id)
+      this.pruneSends()
       this.pushState(`Removida a faixa "${t?.name}"`)
+      this.syncPlayback()
     },
     removeSelectedTracks () {
       this.requireTargets()
       this.tracks = this.tracks.filter(t => !t.selected)
+      this.pruneSends()
       this.pushState('Faixas removidas')
+      this.syncPlayback()
+    },
+    // Envios para barramentos que não existem mais.
+    pruneSends () {
+      const buses = new Set(this.buses.map(b => b.id))
+      for (const t of this.tracks) if (t.sends.some(s => !buses.has(s.bus))) t.sends = t.sends.filter(s => buses.has(s.bus))
     },
     moveTrack (id, dir) {
       const i = this.tracks.findIndex(t => t.id === id)
@@ -537,14 +616,16 @@ export const useProjectStore = defineStore('project', {
     },
     // "Mix and Render": substitui as faixas selecionadas por uma única mixagem.
     // Os efeitos em tempo real das faixas são aplicados; os do master, não.
+    // Envios e barramentos ficam de fora: só a saída direta das faixas.
     async mixAndRender () {
-      const targets = this.requireTargets()
+      const targets = this.requireEditTargets()
       const t0 = Math.min(...targets.map(t => t.offset))
       const t1 = Math.max(...targets.map(t => this.trackEnd(t)))
-      const withFx = targets.some(t => isMidi(t) || t.effects.some(e => e.enabled))
+      const withFx = targets.some(t => isMidi(t) || t.effects.some(e => e.enabled) || hasAutomation(t))
       const stereo = withFx || targets.some(t => t.channels.length > 1 || t.pan !== 0)
+      const tracks = targets.map(t => ({ ...engineView(t), sends: [] }))
       const channels = withFx
-        ? await engine.render({ tracks: targets, rate: this.rate, t0, t1, master: this.master, applyMaster: false, channels: stereo ? 2 : 1 })
+        ? await engine.render({ tracks, rate: this.rate, t0, t1, master: this.master, applyMaster: false, channels: stereo ? 2 : 1 })
         : mixdown(targets, this.rate, t0, t1, stereo ? 2 : 1)
       const index = this.tracks.indexOf(targets[0])
       const mixed = makeTrack({ name: 'Mixagem', channels, offset: t0, selected: true })
@@ -638,7 +719,8 @@ export const useProjectStore = defineStore('project', {
       const t = this.fxTarget(id)
       if (isMidi(t)) return this.renderMidiToAudio(id)
       if (!t.effects.length) throw new Error('A faixa não tem efeitos.')
-      const dry = { ...toRaw(t), gain: 0, pan: 0, mute: false, solo: false }
+      if (isFrozen(t)) throw new Error('Descongele a faixa antes de aplicar os efeitos.')
+      const dry = { ...toRaw(t), gain: 0, pan: 0, mute: false, solo: false, sends: [], automation: null }
       const channels = await engine.render({
         tracks: [dry], rate: this.rate, t0: t.offset, t1: this.trackEnd(t),
         master: this.master, applyMaster: false, channels: t.channels.length
@@ -654,14 +736,109 @@ export const useProjectStore = defineStore('project', {
       // Parado, o motor nativo também recebe o projeto: os plugins das cadeias
       // ficam carregados (janela, parâmetros) e o primeiro play começa mais rápido.
       if (!this.playing) return this.syncEngine()
-      if (engine.updateMix(this.tracks, this.master)) return
+      if (engine.updateMix(this.engineTracks, this.master)) return
       const { t1, isSelection } = this.playRange
       this.play({ t0: engine.position(), t1, isSelection })
     },
 
     // Só o motor nativo precisa disso; no Web Audio o grafo existe só tocando.
     syncEngine () {
-      return engine.syncIdle?.(this.tracks, this.master, this.rate)
+      return engine.syncIdle?.(this.engineTracks, this.master, this.rate)
+    },
+
+    // ---------- Barramentos e envios ----------
+    newBusTrack () {
+      this.tracks.forEach(t => { t.selected = false })
+      const bus = this.addTrack({ kind: 'bus', name: `Barramento ${this.buses.length + 1}`, selected: true })
+      this.pushState('Novo barramento')
+      this.syncPlayback()
+      return bus
+    },
+
+    addSend (trackId, busId, level = SEND_DEFAULT_DB) {
+      const t = this.findTrack(trackId)
+      const bus = this.findTrack(busId)
+      if (!t || isBus(t)) throw new Error('Envios saem de faixas de áudio ou MIDI.')
+      if (!bus || !isBus(bus)) throw new Error('Escolha um barramento.')
+      if (t.sends.some(s => s.bus === busId)) return
+      t.sends = [...t.sends, { bus: busId, level }]
+      this.pushState(`Envio de "${t.name}" para "${bus.name}"`)
+      this.syncPlayback()
+    },
+
+    setSendLevel (trackId, busId, level) {
+      const t = this.findTrack(trackId)
+      if (!t) return
+      t.sends = t.sends.map(s => (s.bus === busId ? { ...s, level } : s))
+      this.pushState('Nível de envio alterado', true)
+      this.syncPlayback()
+    },
+
+    removeSend (trackId, busId) {
+      const t = this.findTrack(trackId)
+      if (!t) return
+      t.sends = t.sends.filter(s => s.bus !== busId)
+      this.pushState('Envio removido')
+      this.syncPlayback()
+    },
+
+    // ---------- Automação ----------
+    // Sem `desc`, é uma prévia (arrastando um ponto); o commit vem com commitAutomation.
+    setAutomation (id, param, points, desc = null) {
+      const t = this.findTrack(id)
+      if (!t || !AUTOMATION_PARAMS[param]) return
+      const { min, max } = AUTOMATION_PARAMS[param]
+      const lane = points
+        .map(p => ({ t: Math.max(0, p.t), v: Math.max(min, Math.min(max, p.v)) }))
+        .sort((a, b) => a.t - b.t)
+      t.automation = { ...(t.automation ?? EMPTY_AUTOMATION), [param]: lane }
+      this.syncPlayback()
+      if (desc) this.pushState(desc)
+    },
+
+    commitAutomation (param) {
+      this.pushState(param === 'pan' ? 'Automação de pan alterada' : 'Automação de volume alterada')
+    },
+
+    clearAutomation (id, param) {
+      const t = this.findTrack(id)
+      if (!t?.automation?.[param]?.length) return
+      this.setAutomation(id, param, [], param === 'pan' ? 'Automação de pan removida' : 'Automação de volume removida')
+    },
+
+    // ---------- Congelar faixa ----------
+    // Renderiza instrumento e efeitos da faixa uma vez; o motor passa a tocar o
+    // áudio e descarrega os plugins dela (alivia o processador).
+    async freezeTrack (id) {
+      const t = this.findTrack(id)
+      if (!t || isBus(t)) throw new Error('Barramentos não podem ser congelados.')
+      if (isFrozen(t)) return
+      if (!isMidi(t) && !t.effects.some(e => e.enabled)) throw new Error('A faixa não tem efeitos ligados: não há o que congelar.')
+      if (isMidi(t) ? !t.notes.length : !t.channels[0].length) throw new Error('A faixa está vazia.')
+      const dry = { ...toRaw(t), gain: 0, pan: 0, mute: false, solo: false, sends: [], automation: null }
+      const channels = await engine.render({
+        tracks: [dry], rate: this.rate, t0: t.offset, t1: this.trackEnd(t) + FREEZE_TAIL,
+        master: this.master, applyMaster: false, channels: 2
+      })
+      t.frozen = markRaw({
+        channels: markRaw(channels),
+        channelsRef: toRaw(t.channels),
+        notesRef: toRaw(t.notes),
+        effectsRef: toRaw(t.effects),
+        instrumentRef: toRaw(t.instrument),
+        program: t.program,
+        drum: t.drum
+      })
+      this.pushState(`Faixa congelada: "${t.name}"`)
+      this.syncPlayback()
+    },
+
+    unfreezeTrack (id) {
+      const t = this.findTrack(id)
+      if (!t?.frozen) return
+      t.frozen = null
+      this.pushState(`Faixa descongelada: "${t.name}"`)
+      this.syncPlayback()
     },
 
     // ---------- MIDI ----------
@@ -715,13 +892,16 @@ export const useProjectStore = defineStore('project', {
       const t = this.findTrack(id)
       if (!t || !isMidi(t) || !t.notes.length) throw new Error('Selecione uma faixa MIDI com notas.')
       const tail = 1.5 // cauda para o release das notas
-      const solo = { ...toRaw(t), gain: 0, pan: 0, mute: false, solo: false }
+      const solo = { ...toRaw(t), gain: 0, pan: 0, mute: false, solo: false, sends: [], automation: null }
       const channels = await engine.render({
         tracks: [solo], rate: this.rate, t0: t.offset, t1: this.trackEnd(t) + tail,
         master: this.master, applyMaster: false, channels: 2
       })
       const index = this.tracks.indexOf(t)
-      const audio = makeTrack({ name: `${t.name} (áudio)`, channels, offset: t.offset, gain: t.gain, pan: t.pan, color: t.color, selected: true })
+      const audio = makeTrack({
+        name: `${t.name} (áudio)`, channels, offset: t.offset, gain: t.gain, pan: t.pan, color: t.color,
+        sends: t.sends, automation: t.automation, selected: true
+      })
       t.selected = false
       t.mute = true
       this.tracks.splice(index + 1, 0, audio)
@@ -809,7 +989,7 @@ export const useProjectStore = defineStore('project', {
         if (!isSelection && t0 >= this.duration) t0 = 0
       }
       if (t1 <= t0) return
-      await engine.play(this.tracks, this.rate, t0, t1, this.master)
+      await engine.play(this.engineTracks, this.rate, t0, t1, this.master)
       this.playRange = { t0, t1, isSelection: !!isSelection }
       this.playing = true
       this.paused = false
@@ -917,7 +1097,7 @@ export const useProjectStore = defineStore('project', {
         throw new Error(`Não foi possível acessar o microfone: ${e.message}`)
       }
       // Overdub: toca o projeto a partir do cursor enquanto grava.
-      if (this.duration > t0) await engine.play(this.tracks, this.rate, t0, this.duration, this.master)
+      if (this.duration > t0) await engine.play(this.engineTracks, this.rate, t0, this.duration, this.master)
       this.recTake = { ids: rec.ids, t0, length: 0 }
       this.recording = true
       this.startTicker()
@@ -929,7 +1109,7 @@ export const useProjectStore = defineStore('project', {
       const t0 = this.sel.t0
       rec = { midi: true, ids: [track.id], t0, events: [], timer: null }
       await engine.startMidiRecording()
-      await engine.play(this.tracks, this.rate, t0, t0 + MIDI_RECORD_LIMIT, this.master)
+      await engine.play(this.engineTracks, this.rate, t0, t0 + MIDI_RECORD_LIMIT, this.master)
       rec.timer = setInterval(() => {
         const r = rec
         if (r?.midi) engine.readMidiRecording().then(events => r.events.push(...events)).catch(() => {})
@@ -983,6 +1163,7 @@ export const useProjectStore = defineStore('project', {
       let s = this.toSample(track, t)
       if (s < 0) {
         channels = channels.map(ch => concat([zeros(-s), ch]))
+        track.automation = shiftAutomation(track.automation, -s / this.rate)
         track.offset = t
         s = 0
       }

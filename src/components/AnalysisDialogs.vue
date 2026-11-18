@@ -106,7 +106,7 @@ function noteName (f) {
 }
 
 async function computeSpectrum () {
-  const track = store.selectedTracks.find(t => t.kind !== 'midi')
+  const track = store.selectedTracks.find(t => t.kind === 'audio')
   if (!track) return
   const signal = monoRegion(track)
   if (signal.length < fftSize.value) {
@@ -195,7 +195,7 @@ const minRun = ref(3)
 const clips = ref([])
 function computeClipping () {
   const out = []
-  for (const t of store.selectedTracks.filter(x => x.kind !== 'midi')) {
+  for (const t of store.selectedTracks.filter(x => x.kind === 'audio')) {
     const [s0] = store.regionOf(t)
     const base = t.offset + s0 / store.rate
     for (const hit of findClipping(store.regionChannels(t), store.rate, Math.max(1, minRun.value))) {
@@ -213,7 +213,7 @@ function selectClip (c) {
 // ---------- Estatísticas ----------
 const statRows = ref([])
 function computeStats () {
-  statRows.value = store.selectedTracks.filter(t => t.kind !== 'midi').flatMap(t =>
+  statRows.value = store.selectedTracks.filter(t => t.kind === 'audio').flatMap(t =>
     stats(store.regionChannels(t)).map((s, c) => ({ ...s, name: `${t.name}${t.channels.length > 1 ? (c ? ' (D)' : ' (E)') : ''}` })))
 }
 const fmtDb = v => (isFinite(v) ? `${v.toFixed(2)} dB` : '-∞ dB')

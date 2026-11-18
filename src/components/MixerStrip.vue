@@ -18,7 +18,7 @@
       />
       <div class="pan-label mono">{{ panLabel }}</div>
     </div>
-    <div v-else class="pan pan-label mono">estÃ©reo</div>
+    <div v-else class="pan pan-label mono">estéreo</div>
 
     <div class="fader-area row no-wrap col">
       <div class="scale mono">
@@ -57,7 +57,7 @@
 
 <script setup>
 // Uma coluna da mesa de som, como o MixerTrackCluster do Audacity (src/MixerBoard.cpp):
-// nome, pan, fader de volume, medidor e mudo/solo. Aqui tambÃ©m mostra os
+// nome, pan, fader de volume, medidor e mudo/solo. Aqui também mostra os
 // inserts (efeitos em tempo real) da faixa.
 
 import { computed, reactive, watch } from 'vue'
@@ -109,7 +109,7 @@ function onSelect (e) {
   if (!isMaster.value) store.selectTrack(props.track.id, e.ctrlKey || e.metaKey)
 }
 
-// RetenÃ§Ã£o de pico por 1,5 s.
+// Retenção de pico por 1,5 s.
 const holds = reactive([0, 0])
 const holdTime = [0, 0]
 watch(() => props.levels, lv => {

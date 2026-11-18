@@ -45,24 +45,38 @@ const MAGIC = 'REAP' // assinatura mantida para abrir projetos antigos
 const effectJson = ({ type, params, enabled, plugin, state }) =>
   type === 'plugin' ? { type, enabled, plugin, state } : { type, params, enabled }
 
+// Envios guardam a posição do barramento na lista (os ids mudam ao abrir); a
+// faixa congelada é salva sem o áudio pré-renderizado (congela de novo se precisar).
 export function encodeProject (project) {
+  const index = new Map(project.tracks.map((t, i) => [t.id, i]))
+  const mixing = t => ({
+    sends: (t.sends ?? []).map(s => ({ bus: index.get(s.bus), level: s.level })),
+    automation: { gain: t.automation?.gain ?? [], pan: t.automation?.pan ?? [] }
+  })
   const header = {
     version: 1,
     name: project.name,
     rate: project.rate,
     tempo: project.tempo ?? 120,
-    tracks: project.tracks.map(t => t.kind === 'midi'
+    tracks: project.tracks.map(t => t.kind === 'bus'
+      ? {
+          kind: 'bus', name: t.name, color: t.color, offset: 0, gain: t.gain, pan: t.pan, mute: t.mute, solo: t.solo,
+          channels: 0, length: 0, effects: (t.effects ?? []).map(effectJson), automation: mixing(t).automation
+        }
+      : t.kind === 'midi'
       ? {
           kind: 'midi', name: t.name, color: t.color, offset: t.offset, gain: t.gain, pan: t.pan, mute: t.mute, solo: t.solo,
           program: t.program, drum: t.drum, channels: 0, length: 0,
           instrument: t.instrument ? { plugin: t.instrument.plugin, state: t.instrument.state } : null,
           effects: (t.effects ?? []).map(effectJson),
-          notes: t.notes.map(({ pitch, start, dur, vel }) => ({ pitch, start, dur, vel }))
+          notes: t.notes.map(({ pitch, start, dur, vel }) => ({ pitch, start, dur, vel })),
+          ...mixing(t)
         }
       : {
           name: t.name, color: t.color, offset: t.offset, gain: t.gain, pan: t.pan, mute: t.mute, solo: t.solo,
           effects: (t.effects ?? []).map(effectJson),
-          channels: t.channels.length, length: t.channels[0].length
+          channels: t.channels.length, length: t.channels[0].length,
+          ...mixing(t)
         }),
     master: {
       gain: project.master?.gain ?? 0,
@@ -91,6 +105,7 @@ export async function decodeProject (blob) {
       pos += t.length * 4
     }
     if (t.kind === 'midi') return { ...t, channels: [], notes: t.notes.map(n => ({ ...n, id: noteId() })) }
+    if (t.kind === 'bus') return { ...t, channels: [] }
     return { ...t, channels }
   })
   return { name: header.name, rate: header.rate, tempo: header.tempo, tracks, master: header.master }

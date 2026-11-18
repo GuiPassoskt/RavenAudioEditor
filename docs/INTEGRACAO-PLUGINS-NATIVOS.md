@@ -311,7 +311,7 @@ nele em fases. A Fase 1 usa esse mesmo processo só para aplicar efeitos (Opçã
 | 2 ✅ | **Motor nativo** de reprodução e mixagem (I/O nativo, grafo, transporte). O Web Audio sai do app desktop (seção 4.6) | Nativo | Concluída |
 | 3 ✅ | Plugins **em tempo real** nas cadeias de faixa e master, mais as janelas nativas dos plugins (seção 4.7) | Nativo | Concluída |
 | 4 ✅ | Instrumentos virtuais (VSTi) nas faixas MIDI, entrada MIDI de hardware, gravação com compensação de latência (seção 4.8) | Nativo | Concluída |
-| 5 | Recursos de DAW: automação, clips, envios/barramentos, congelar faixa, render em segundo plano | Nativo | Médio |
+| 5 🟡 | Recursos de DAW: automação, envios/barramentos, congelar faixa e render em segundo plano feitos (seção 4.9); falta **clips** (vários trechos por faixa) | Nativo | Em andamento |
 
 ```mermaid
 flowchart LR
@@ -320,7 +320,7 @@ flowchart LR
   F2["Fase 2 ✅<br/>Motor nativo<br/>I/O, grafo, transporte"]
   F3["Fase 3 ✅<br/>Plugins em tempo real<br/>janelas nativas"]
   F4["Fase 4 ✅<br/>VSTi, MIDI de hardware,<br/>latência de gravação"]
-  F5["Fase 5<br/>DAW: automação, clips,<br/>barramentos, congelar"]
+  F5["Fase 5 🟡<br/>DAW: automação, barramentos,<br/>congelar, render ✅ · clips"]
   F0 --> F1 --> F2 --> F3 --> F4 --> F5
 
   WA[["Motor Web Audio atual"]] -. "ainda em uso" .- F0
@@ -804,7 +804,97 @@ Dispositivos de áudio → Gravação), para o take ficar alinhado com o que se 
 | Gravação MIDI com R pela interface + desfazer | 2 notas, intervalo e duração certos |
 | Ajuste de 800 ms na compensação da gravação de áudio | take ~0,76 s mais curto |
 
-### 4.9 Ambiente de desenvolvimento (Windows)
+### 4.9 Fase 5: recursos de DAW (como está implementado)
+
+Quatro dos cinco itens. **Clips** (vários trechos independentes numa faixa, cada um
+com posição e corte próprios) ficam para uma etapa à parte, porque mudam o modelo
+de dados da faixa, a edição e o desenho.
+
+**Envios e barramentos.** **Faixas → Novo barramento** cria uma faixa sem conteúdo
+(`kind: 'bus'`) que recebe envios; ela tem efeitos, volume, pan, mudo e solo como
+as outras. No painel de efeitos de uma faixa, a seção **Envios** liga a faixa a um
+barramento (−6 dB por padrão, slider de −60 a +6 dB); o painel do barramento lista
+quem envia para ele. O cabeçalho e o canvas do barramento mostram quantos envios
+ele recebe.
+
+- O envio é **pós-fader**: sai depois do volume, do pan e da automação da faixa. Faixa
+  muda não envia.
+- **Solo seguro**: barramentos não entram na conta do solo. Solar uma faixa cala as
+  outras, mas não o reverb compartilhado que ela alimenta.
+- **Compensação de latência**: as faixas alinham entre si, como antes; a saída direta
+  das faixas espera, além disso, o barramento mais lento (segunda linha de atraso
+  por faixa), para o som direto e o que volta do barramento chegarem juntos.
+- No motor nativo o grafo roda em duas passadas por bloco: faixas (somando os
+  envios nos buffers dos barramentos) e depois barramentos. No Web Audio, cada envio
+  é um `GainNode` da saída da faixa para a entrada da cadeia do barramento.
+- Os envios guardam o id do barramento; no `.ravenproj`, a posição dele na lista.
+  Remover um barramento remove os envios para ele.
+
+**Automação de volume e pan.** Ferramenta **Envelope** na barra (F3), com a escolha
+**Vol / Pan** ao lado. Clicar no canvas da faixa cria um ponto (numa linha vazia, ou
+em cima da linha, no valor que a linha tinha), arrastar move, duplo clique remove;
+cada gesto vira um passo do desfazer ("Automação de volume alterada"). O menu ⋮ da
+faixa tem "Remover automação de volume/pan".
+
+- `track.automation = { gain: [{ t, v }], pan: [{ t, v }] }`, com `t` em segundos desde
+  o início da faixa: mover a faixa leva a automação junto. Recortar, colar, aparar e
+  gravar por cima deslocam os pontos com o áudio (`src/audio/automation.js`).
+- **Volume em dB somados ao fader** (como o envelope do Audacity): o fader continua
+  valendo. **Pan substitui** o pan da faixa enquanto houver pontos.
+- Entre pontos, linha reta; antes do primeiro e depois do último, o valor deles.
+- Motor nativo: alvo recalculado a cada 32 amostras e suavizado, no tempo do áudio
+  que chega ao ganho (descontada a latência das cadeias). Web Audio: rampas lineares
+  nos ganhos L/R, amostradas a cada 20 ms onde o volume muda. Diferença medida entre
+  os dois num caso com rampa de volume, pan e barramento: −35 dB do pico.
+
+**Congelar faixa.** Botão ❄ no cabeçalho, item no menu ⋮ e **Faixas → Congelar /
+descongelar faixas selecionadas**. Renderiza o instrumento e os efeitos da faixa
+(seco: sem volume, pan, automação e envios, com 2 s de cauda) e, a partir daí, o
+motor toca esse áudio no lugar da cadeia, que é descarregada (alivia o processador
+com VSTi e plugins pesados). Volume, pan, automação, envios, mudo e solo continuam
+ao vivo.
+
+- `track.frozen` guarda o áudio e referências do que foi renderizado (canais, notas,
+  cadeia, instrumento, programa). **Editar qualquer um deles descongela sozinho**; o
+  desfazer volta ao estado congelado. O painel de efeitos avisa que a faixa está
+  congelada.
+- O store entrega ao motor `engineTracks` (as congeladas como faixas de áudio sem
+  cadeia); exportar, mixar e renderizar usam o mesmo caminho.
+- O áudio congelado não vai para o `.ravenproj`: ao abrir, a faixa volta descongelada.
+
+**Render em segundo plano.** Exportar não trava mais o motor: `render.offline` monta
+o grafo e os plugins no thread de mensagens (os plugins pedem isso) e processa num
+thread próprio. O motor continua atendendo a interface, então dá para tocar e
+editar enquanto exporta. A exportação usa o projeto como estava ao começar.
+
+- Eventos `render.progress { job, progress }` a cada 200 ms; `render.cancel { job }`
+  interrompe e a resposta vira o erro "Render cancelado.". Os plugins do render são
+  destruídos no thread de mensagens.
+- Na interface, **Arquivo → Exportar** mostra um aviso com a porcentagem e
+  **Cancelar**. No navegador, o `OfflineAudioContext` pausa em 20 pontos para
+  informar o progresso; cancelar o deixa parado numa pausa (ele não tem como abortar).
+
+**Comandos novos:** `render.cancel`; `render.offline` aceita `job` e emite
+`render.progress`. Em `project.sync` e `render.offline`, as faixas aceitam
+`kind: 'bus'`, `sends: [{ bus, level }]` e `automation`.
+
+**Testado** (18/11/2026):
+
+| Teste | Resultado |
+|---|---|
+| Envio de −6 dB para barramento, no motor e tocando pela interface | 1,500× o nível da faixa |
+| Faixa muda / barramento mudo / solo na faixa | sem envio / só o direto / barramento continua |
+| Duas faixas em 0 dB num barramento em −6 dB | 3,000× |
+| Barramento com MFreeformPhase (8192 amostras de latência) | direto e barramento alinhados (1,500×) |
+| Rampa de 0 a −40 dB entre 0,5 e 1,5 s, fader em −6 dB | −6,0 / −25,6 / −46,0 dB em 0,25 / 1,0 / 1,75 s |
+| Pan automatizado para a esquerda | canal direito em silêncio |
+| Envelope com dois cliques pela interface, desfazer | 2 pontos (0 dB e −35 dB), desfeito |
+| Faixa MIDI congelada pelo botão ❄ | toca (pico 0,28); editar descongela; desfazer congela |
+| Render de 1 min com dois reverbs de 10 s | motor respondeu ao ping em 0 ms durante os 27 s de render; 125 eventos de progresso |
+| Cancelar render / exportação pela interface | erro "Render cancelado." em 29 ms / aviso "Exportação cancelada" |
+| Projeto com barramento salvo e aberto | envio religado ao barramento novo |
+
+### 4.10 Ambiente de desenvolvimento (Windows)
 
 | Ferramenta | Para quê |
 |---|---|
@@ -947,7 +1037,7 @@ um addon do Node.
    mostrava 2083 parâmetros (2080 eram controladores MIDI internos do VST3).
 
    Para compilar numa máquina nova:
-   1. instalar o ambiente da [seção 4.9](#49-ambiente-de-desenvolvimento-windows);
+   1. instalar o ambiente da [seção 4.10](#410-ambiente-de-desenvolvimento-windows);
    2. depois de clonar o repositório: `git submodule update --init`;
    3. `npm run build:engine` (gera `engine/bin/raven-engine.exe`);
    4. teste rápido sem interface, no Git Bash:

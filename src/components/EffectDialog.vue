@@ -72,7 +72,7 @@ const visibleParams = computed(() => {
   if (ui.effect.kind === 'generate' && replacing.value) return def.params.filter(p => p.key !== 'duration')
   return def.params
 })
-const replacing = computed(() => store.hasSelection && store.selectedTracks.some(t => t.kind !== 'midi'))
+const replacing = computed(() => store.hasSelection && store.selectedTracks.some(t => t.kind === 'audio'))
 const description = computed(() => ui.effect?.def.describe?.(params) ?? '')
 const generateHint = computed(() => replacing.value
   ? 'O áudio gerado substituirá a seleção atual.'
@@ -82,7 +82,7 @@ const storageKey = id => `rea.effect.${id}`
 const sliderMax = p => (p.key === 'duration' ? 60 : p.max)
 
 function regionForPrepare () {
-  const t = store.selectedTracks.find(x => x.kind !== 'midi')
+  const t = store.selectedTracks.find(x => x.kind === 'audio')
   return t ? store.regionChannels(t) : null
 }
 

@@ -5,7 +5,7 @@
 // ferramentas e teclado disparam o mesmo comando pelo seu id.
 
 import { Dialog, Loading, Notify } from 'quasar'
-import { useProjectStore } from 'src/stores/project'
+import { isFrozen, useProjectStore } from 'src/stores/project'
 import { useUiStore } from 'src/stores/ui'
 import { EFFECTS, GENERATORS, ANALYZERS } from 'src/audio/effects'
 import { pickFiles } from 'src/audio/fileio'
@@ -48,6 +48,29 @@ export function confirmDiscard (store, {
   })
 }
 
+// Exportação em segundo plano: um aviso com o progresso e "Cancelar"; o editor
+// continua livre (o render roda no motor nativo ou no OfflineAudioContext).
+let exporting = false
+async function exportInBackground (p, options) {
+  if (exporting) throw new Error('Já há uma exportação em andamento.')
+  exporting = true
+  const controller = new AbortController()
+  const notif = Notify.create({
+    group: false, timeout: 0, spinner: true, color: 'grey-9', position: 'bottom-right',
+    message: 'Exportando…', caption: '0%', classes: 'export-progress',
+    actions: [{ label: 'Cancelar', color: 'grey-4', noDismiss: true, handler: () => controller.abort() }]
+  })
+  const done = props => notif({ spinner: false, caption: '', timeout: 2500, actions: [], ...props })
+  try {
+    await p.exportWav({ ...options, onProgress: v => notif({ caption: `${Math.round(v * 100)}%` }), signal: controller.signal })
+    done({ type: 'positive', message: 'Exportação concluída' })
+  } catch (e) {
+    done(controller.signal.aborted ? { message: 'Exportação cancelada' } : { type: 'negative', message: e?.message ?? String(e) })
+  } finally {
+    exporting = false
+  }
+}
+
 let registry = null
 
 export function useCommands () {
@@ -82,8 +105,8 @@ export function useCommands () {
       }
     },
     saveProject: { label: 'Salvar projeto (.ravenproj)', icon: 'save', keys: 'Ctrl+S', run: () => p.saveProject() },
-    exportWav: { label: 'Exportar como WAV 16-bit', icon: 'ios_share', keys: 'Ctrl+Shift+E', run: () => p.exportWav({ format: 'pcm16' }) },
-    exportWavFloat: { label: 'Exportar como WAV 32-bit float', icon: 'ios_share', run: () => p.exportWav({ format: 'float32' }) },
+    exportWav: { label: 'Exportar como WAV 16-bit', icon: 'ios_share', keys: 'Ctrl+Shift+E', run: () => exportInBackground(p, { format: 'pcm16' }) },
+    exportWavFloat: { label: 'Exportar como WAV 32-bit float', icon: 'ios_share', run: () => exportInBackground(p, { format: 'float32' }) },
     importMidi: {
       label: 'Importar MIDI…', icon: 'piano',
       run: async () => {
@@ -92,7 +115,7 @@ export function useCommands () {
       }
     },
     exportMidi: { label: 'Exportar MIDI (.mid) — selecionadas ou todas', icon: 'piano', run: () => p.exportMidi() },
-    exportSelection: { label: 'Exportar seleção (WAV)', icon: 'content_cut', run: () => p.exportWav({ scope: 'selection' }) },
+    exportSelection: { label: 'Exportar seleção (WAV)', icon: 'content_cut', run: () => exportInBackground(p, { scope: 'selection' }) },
 
     // Editar
     undo: { label: 'Desfazer', icon: 'undo', keys: 'Ctrl+Z', run: () => p.undo(), enabled: () => p.canUndo },
@@ -155,6 +178,7 @@ export function useCommands () {
     // Ferramentas
     toolSelect: { label: 'Ferramenta de seleção', icon: 'mdi-cursor-text', keys: 'F1', run: () => { p.tool = 'select' } },
     toolShift: { label: 'Ferramenta de mover no tempo', icon: 'mdi-arrow-left-right', keys: 'F5', run: () => { p.tool = 'shift' } },
+    toolEnvelope: { label: 'Ferramenta de envelope (automação)', icon: 'mdi-chart-bell-curve-cumulative', keys: 'F3', run: () => { p.tool = 'envelope' } },
 
     // Faixas
     newMono: { label: 'Nova faixa mono', icon: 'add', keys: 'Ctrl+Shift+N', run: () => p.newTrack(1) },
@@ -177,6 +201,17 @@ export function useCommands () {
       }
     },
     newStereo: { label: 'Nova faixa estéreo', icon: 'add_circle_outline', run: () => p.newTrack(2) },
+    newBus: { label: 'Novo barramento (envios)', icon: 'mdi-call-merge', run: () => { ui.fxTarget = p.newBusTrack().id } },
+    freezeTracks: {
+      label: 'Congelar / descongelar faixas selecionadas', icon: 'mdi-snowflake',
+      run: async () => {
+        const targets = p.requireEditTargets()
+        const freeze = targets.some(t => !isFrozen(t))
+        await guard(async () => {
+          for (const t of targets) await (freeze ? p.freezeTrack(t.id) : p.unfreezeTrack(t.id))
+        }, { loading: freeze })
+      }
+    },
     removeTracks: { label: 'Remover faixas selecionadas', icon: 'delete', run: () => p.removeSelectedTracks() },
     mixRender: { label: 'Mixar e renderizar', icon: 'merge_type', run: () => p.mixAndRender() },
     stereoToMono: { label: 'Estéreo para mono', icon: 'call_merge', run: () => p.makeStereoToMono() },
@@ -211,7 +246,7 @@ export function useCommands () {
     { label: 'Selecionar', items: ['selectAll', 'selectNone', 'selectAllTracks', '-', 'selectStartToCursor', 'selectCursorToEnd'] },
     { label: 'Exibir', items: ['zoomIn', 'zoomNormal', 'zoomOut', 'zoomSel', 'zoomFit', '-', 'mixer', 'pianoRoll', 'history'] },
     { label: 'Transporte', items: ['playStop', 'pause', 'stop', 'record', '-', 'skipStart', 'skipEnd', 'loop', ...(hasNativeEngine ? ['-', 'audioDevices'] : [])] },
-    { label: 'Faixas', items: ['newMono', 'newStereo', 'newMidi', '-', 'pianoRoll', 'renderMidi', '-', 'mixRender', 'stereoToMono', '-', 'removeTracks'] },
+    { label: 'Faixas', items: ['newMono', 'newStereo', 'newMidi', 'newBus', '-', 'pianoRoll', 'renderMidi', '-', 'freezeTracks', 'mixRender', 'stereoToMono', '-', 'removeTracks'] },
     { label: 'Gerar', items: GENERATORS.map(d => `gen:${d.id}`) },
     { label: 'Efeito', items: ['trackEffects', 'masterEffects', ...(hasNativeEngine ? ['-', 'pluginEffect'] : []), '-', ...EFFECTS.map(d => `fx:${d.id}`)] },
     { label: 'Analisar', items: ANALYZERS.map(d => `an:${d.id}`) },

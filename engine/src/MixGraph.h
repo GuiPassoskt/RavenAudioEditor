@@ -2,8 +2,10 @@
 
 // Grafo de mixagem do motor nativo, o mesmo do motor Web Audio (src/audio/engine.js):
 //
-//   faixa: clipe ou sintetizador -> [efeitos da faixa] -> ganho/pan -> Σ ─┐
-//   master: Σ faixas -> [efeitos master] -> fader -> saída <──────────────┘
+//   faixa: clipe ou instrumento -> [efeitos] -> ganho/pan (automação) -> Σ ───────────┐
+//                                                     └─ envios -> barramento ─┐       │
+//   barramento: Σ envios -> [efeitos] -> ganho/pan -> Σ ──────────────────────┘       │
+//   master: Σ faixas e barramentos -> [efeitos master] -> fader -> saída <────────────┘
 //
 // Um MixGraph é imutável: a cada mudança do projeto o thread de mensagens monta
 // outro e o troca. O que precisa continuar entre trocas (notas soando, caudas de
@@ -58,9 +60,12 @@ struct TrackState : public juce::ReferenceCountedObject
 
     std::atomic<float> peakL { 0 }, peakR { 0 };  // medidores (pico desde a última leitura)
 
-    // Compensação de latência (PDC): atraso desta faixa para alinhar com a mais lenta.
+    // Compensação de latência (PDC): atraso desta faixa para alinhar com a mais lenta,
+    // e atraso da saída direta para alinhar com o que passa pelos barramentos.
     juce::AudioBuffer<float> delayLine;  // até 1 s
     int delayIndex = 0;
+    juce::AudioBuffer<float> busDelayLine;  // até 1 s
+    int busDelayIndex = 0;
 
     // Eventos MIDI ao vivo (nota avulsa do piano roll). Produtor: thread de
     // mensagens; consumidor: thread de áudio. delay = amostras até o evento.
@@ -104,9 +109,20 @@ public:
         int program = 0;
         bool drum = false;
         bool isMidi = false;
+        bool isBus = false;    // barramento: recebe envios, não tem fonte própria
+        bool audible = true;   // mudo / solo
+        float volume = 1;      // ganho linear sem automação
+        float pan = 0;
+        struct Point { double time; float value; };  // segundos desde o início da faixa
+        std::vector<Point> gainEnvelope;             // automação de volume (dB, somados ao fader)
+        std::vector<Point> panEnvelope;              // automação de pan (−1..1)
+        struct Send { int bus; float gain; };        // envio pós-fader para um barramento
+        std::vector<Send> sends;
+        int busDelay = 0;      // atraso da saída direta (latência dos barramentos)
         PluginEffect::Ptr instrument;  // VSTi; sem ele, o sintetizador embutido
         std::vector<RealtimeEffect::Ptr> effects;
         int compensation = 0;  // amostras de atraso para alinhar com a faixa mais lenta
+        int automationDelay = 0; // atraso total até o ganho (a automação segue o áudio que chega)
     };
 
     // De onde vêm os objetos que o grafo usa: ao vivo, o motor reaproveita os que
@@ -156,6 +172,7 @@ public:
 
 private:
     void scheduleNotes (Track& t, int numSamples, juce::int64 position, juce::int64 end);
+    void finishTrack (Track& t, int numSamples, juce::int64 position);
     void collectMidi (Track& t, int numSamples, juce::int64 position, bool running, const juce::MidiBuffer* live);
 };
 

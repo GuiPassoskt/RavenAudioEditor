@@ -15,8 +15,11 @@ const bridge = typeof window !== 'undefined' ? window.audio : undefined
 const METERS_STALE_MS = 200 // sem medidores recentes, os níveis caem a zero
 const CAPTURE_POLL_MS = 100 // a gravação é lida do motor a cada 100 ms
 
-const isAudio = t => t.kind !== 'midi'
+const isAudio = t => t.kind === 'audio'
+let nextRenderJob = 1
 const request = (cmd, args) => call(() => bridge.request(cmd, args))
+// Objetos simples: o IPC não clona os proxies reativos do store.
+const points = lane => (lane ?? []).map(p => ({ t: p.t, v: p.v }))
 
 export class NativeAudioEngine {
   kind = 'native'
@@ -39,6 +42,7 @@ export class NativeAudioEngine {
   #uploading = new Map() // id -> Promise
   #notesSent = new Map() // id da faixa -> notesKey enviado
   #statesSent = new Map() // uid do plugin -> stateVersion que o motor já tem
+  #renderProgress = new Map() // job -> onProgress
 
   constructor () {
     bridge.onEvent((name, msg) => this.#onEvent(name, msg))
@@ -48,6 +52,8 @@ export class NativeAudioEngine {
     if (name === 'meters') {
       this.#meters = msg
       this.#metersAt = performance.now()
+    } else if (name === 'render.progress') {
+      this.#renderProgress.get(msg.job)?.(msg.progress)
     } else if (name === 'transport.ended') {
       this.#ended = true
     } else if (name === 'ready' || name === 'engine.exit') {
@@ -116,8 +122,11 @@ export class NativeAudioEngine {
       tracks: tracks.map(t => {
         const json = {
           id: String(t.id), kind: t.kind, offset: t.offset, gain: t.gain, pan: t.pan,
-          mute: t.mute, solo: t.solo, effects: (t.effects ?? []).map(fxJson)
+          mute: t.mute, solo: t.solo, effects: (t.effects ?? []).map(fxJson),
+          sends: (t.sends ?? []).map(s => ({ bus: String(s.bus), level: s.level })),
+          automation: t.automation ? { gain: points(t.automation.gain), pan: points(t.automation.pan) } : null
         }
+        if (t.kind === 'bus') return json
         if (isAudio(t)) return { ...json, clip: t.channels[0]?.length ? this.#clipId(t.channels) : null }
 
         Object.assign(json, {
@@ -227,11 +236,23 @@ export class NativeAudioEngine {
   }
 
   // ---- Render offline (exportar, mixar, aplicar efeitos, MIDI em áudio) ----
-  async render ({ tracks, rate, t0, t1, master, applyMaster = true, channels = 2 }) {
+  // Roda num thread do motor: tocar e editar continuam funcionando enquanto isso.
+  async render ({ tracks, rate, t0, t1, master, applyMaster = true, channels = 2, onProgress, signal }) {
     await this.#queue
     await this.#ensureClips(tracks)
+    if (signal?.aborted) throw new Error('Render cancelado.')
     const project = this.#projectJson(tracks, master, rate, true)
-    const [l, r] = await call(() => bridge.receiveAudio('render.offline', { project, t0, t1, applyMaster }))
+    const job = `r${nextRenderJob++}`
+    const cancel = () => request('render.cancel', { job }).catch(() => {})
+    if (onProgress) this.#renderProgress.set(job, onProgress)
+    signal?.addEventListener('abort', cancel)
+    let l, r
+    try {
+      [l, r] = await call(() => bridge.receiveAudio('render.offline', { project, t0, t1, applyMaster, job }))
+    } finally {
+      this.#renderProgress.delete(job)
+      signal?.removeEventListener('abort', cancel)
+    }
     if (channels === 2) return [l, r]
     const mono = new Float32Array(l.length)
     for (let i = 0; i < l.length; i++) mono[i] = (l[i] + r[i]) / 2

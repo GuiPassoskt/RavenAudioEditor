@@ -64,6 +64,13 @@
       <button class="pbtn compact" :class="{ active: store.tool === 'shift' }" title="Mover no tempo (F5)" @click="exec('toolShift')">
         <q-icon name="sym_r_swap_horiz" size="20px" />
       </button>
+      <button class="pbtn compact" :class="{ active: store.tool === 'envelope' }" title="Envelope: automação de volume e pan (F3)" @click="exec('toolEnvelope')">
+        <q-icon name="mdi-chart-bell-curve-cumulative" size="20px" />
+      </button>
+      <template v-if="store.tool === 'envelope'">
+        <button class="pbtn compact env-param" :class="{ active: ui.envelopeParam === 'gain' }" title="Editar a automação de volume" @click="ui.envelopeParam = 'gain'">Vol</button>
+        <button class="pbtn compact env-param" :class="{ active: ui.envelopeParam === 'pan' }" title="Editar a automação de pan" @click="ui.envelopeParam = 'pan'">Pan</button>
+      </template>
     </div>
 
     <!-- Edição -->
@@ -181,6 +188,7 @@ const statusClass = computed(() => ({
 .pbtn:active:not(:disabled) { background: #33264d; }
 .pbtn:disabled { color: #6b5e85; cursor: default; }
 .pbtn.compact { min-width: 34px; padding: 0 7px; }
+.pbtn.env-param { font-size: 11px; font-weight: 600; }
 .pbtn.active { color: #b79cff; background: rgba(139,92,246, 0.16); }
 
 /* Ícones Material Symbols preenchidos (play, stop, pular) */

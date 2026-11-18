@@ -15,7 +15,9 @@
 
 #include <juce_audio_devices/juce_audio_devices.h>
 
+#include <list>
 #include <map>
+#include <thread>
 
 namespace raven
 {
@@ -34,6 +36,11 @@ public:
 
     juce::var status() const;
 
+    // render.offline roda num thread próprio (exportar sem travar o motor): a
+    // resposta ao pedido `id` sai quando terminar, com eventos render.progress
+    // no caminho. render.cancel { job } interrompe.
+    void renderOffline (const juce::var& id, const juce::var& message);
+
 private:
     class MixSource;
     class LiveResources;
@@ -51,7 +58,7 @@ private:
     juce::var playPreview (const juce::var& message);
     juce::var stopPreview();
     juce::var audition (const juce::var& message);
-    juce::var renderOffline (const juce::var& message);
+    juce::var cancelRender (const juce::var& message);
     juce::var startCapture (const juce::var& message);
     juce::var readCapture (const juce::var& message);
     juce::var stopCapture();
@@ -107,6 +114,17 @@ private:
     std::map<juce::String, juce::String> failedPlugins;  // uid -> pluginId que não carregou (não tenta de novo)
     juce::var lastProject;                               // último project.sync (para remontar o grafo)
     std::vector<juce::ReferenceCountedObjectPtr<juce::ReferenceCountedObject>> releasePool;
+
+    // Renders em segundo plano (a lista só é mexida no thread de mensagens).
+    struct RenderJob
+    {
+        juce::String name;
+        std::atomic<bool> cancel { false };
+        std::atomic<bool> finished { false };
+        std::thread thread;
+    };
+    std::list<std::unique_ptr<RenderJob>> renderJobs;
+    void joinFinishedRenders();
 
     // Grafo atual: o thread de mensagens troca, o de áudio copia com try-lock.
     juce::SpinLock graphLock;

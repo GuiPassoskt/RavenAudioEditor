@@ -313,6 +313,11 @@ AudioEngine::AudioEngine (juce::File settings, PluginHost& pluginHost)
 
 AudioEngine::~AudioEngine()
 {
+    for (auto& job : renderJobs)
+        job->cancel = true;
+    for (auto& job : renderJobs)
+        job->thread.join();
+
     stopTimer();
     if (midiInput != nullptr)
         midiInput->stop();
@@ -343,7 +348,7 @@ juce::var AudioEngine::handle (const juce::String& cmd, const juce::var& message
     if (cmd == "preview.play")      return playPreview (message);
     if (cmd == "preview.stop")      return stopPreview();
     if (cmd == "synth.audition")    return audition (message);
-    if (cmd == "render.offline")    return renderOffline (message);
+    if (cmd == "render.cancel")     return cancelRender (message);
     if (cmd == "capture.start")     return startCapture (message);
     if (cmd == "capture.read")      return readCapture (message);
     if (cmd == "capture.stop")      return stopCapture();
@@ -710,17 +715,33 @@ juce::var AudioEngine::audition (const juce::var& message)
     return true;
 }
 
-juce::var AudioEngine::renderOffline (const juce::var& message)
+void AudioEngine::joinFinishedRenders()
 {
+    for (auto it = renderJobs.begin(); it != renderJobs.end();)
+    {
+        if ((*it)->finished)
+        {
+            (*it)->thread.join();
+            it = renderJobs.erase (it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+// O grafo e os plugins são criados aqui, no thread de mensagens (os plugins
+// pedem isso); o processamento vai para um thread próprio, e o motor continua
+// atendendo a interface (tocar, editar) enquanto exporta.
+void AudioEngine::renderOffline (const juce::var& id, const juce::var& message)
+{
+    joinFinishedRenders();
+
     const auto& project = message["project"];
     const double rate = project["rate"];
     if (rate < 8000 || rate > 384000)
         throw CommandError ("Taxa de amostragem inválida.");
-
-    OfflineResources resources (*this, rate);
-    auto offline = MixGraph::build (project, rate, (bool) message["applyMaster"], resources);
-    for (auto& fx : resources.created)
-        fx->waitUntilReady();
 
     // Mesmo tamanho do OfflineAudioContext de engine.js.
     const auto start = (juce::int64) std::llround ((double) message["t0"] * rate);
@@ -728,30 +749,85 @@ juce::var AudioEngine::renderOffline (const juce::var& message)
     if (frames > std::numeric_limits<int>::max())
         throw CommandError ("Trecho longo demais para renderizar.");
 
-    juce::AudioBuffer<float> result (2, (int) frames);
-    juce::AudioBuffer<float> block (2, maxBlock);
-    MasterState master;
-    master.prepare (rate);
-    offline->locate (start);
+    OfflineResources resources (*this, rate);
+    auto offline = MixGraph::build (project, rate, (bool) message["applyMaster"], resources);
 
-    // Com plugins que atrasam o sinal, renderiza a mais e descarta o começo.
-    const auto latency = (juce::int64) offline->totalLatency;
-    for (juce::int64 done = 0; done < frames + latency;)
+    auto job = std::make_unique<RenderJob>();
+    job->name = message["job"].toString();
+    auto* jobPtr = job.get();
+    const juce::File output (message["output"].toString());
+
+    job->thread = std::thread ([jobPtr, id, offline, created = resources.created, start, frames, rate, output] () mutable
     {
-        const int n = (int) juce::jmin<juce::int64> (maxBlock, frames + latency - done);
-        block.clear();
-        offline->render (block, n, start + done, start + frames, master);
+        const auto progress = [&] (double value)
+        {
+            sendEvent ("render.progress", object ({ { "job", jobPtr->name }, { "progress", value } }));
+        };
 
-        const auto from = juce::jmax<juce::int64> (done, latency);
-        const auto count = done + n - from;
-        if (count > 0)
-            for (int c = 0; c < 2; ++c)
-                result.copyFrom (c, (int) (from - latency), block, c, (int) (from - done), (int) count);
-        done += n;
-    }
+        for (auto& fx : created)
+            fx->waitUntilReady();
 
-    writePlanarFile (juce::File (message["output"].toString()), result);
-    return juce::var (object ({ { "frames", frames } }).get());
+        juce::AudioBuffer<float> result (2, (int) frames);
+        juce::AudioBuffer<float> block (2, maxBlock);
+        MasterState master;
+        master.prepare (rate);
+        offline->locate (start);
+
+        // Com plugins que atrasam o sinal, renderiza a mais e descarta o começo.
+        const auto latency = (juce::int64) offline->totalLatency;
+        auto lastProgress = juce::Time::getMillisecondCounter();
+        for (juce::int64 done = 0; done < frames + latency && ! jobPtr->cancel;)
+        {
+            const int n = (int) juce::jmin<juce::int64> (maxBlock, frames + latency - done);
+            block.clear();
+            offline->render (block, n, start + done, start + frames, master);
+
+            const auto from = juce::jmax<juce::int64> (done, latency);
+            const auto count = done + n - from;
+            if (count > 0)
+                for (int c = 0; c < 2; ++c)
+                    result.copyFrom (c, (int) (from - latency), block, c, (int) (from - done), (int) count);
+            done += n;
+
+            if (juce::Time::getMillisecondCounter() - lastProgress > 200)
+            {
+                progress ((double) done / (double) (frames + latency));
+                lastProgress = juce::Time::getMillisecondCounter();
+            }
+        }
+
+        if (jobPtr->cancel)
+        {
+            sendError (id, "Render cancelado.");
+        }
+        else
+        {
+            try
+            {
+                writePlanarFile (output, result);
+                progress (1.0);
+                sendResult (id, juce::var (object ({ { "frames", frames } }).get()));
+            }
+            catch (const std::exception& e)
+            {
+                sendError (id, juce::String::fromUTF8 (e.what()));
+            }
+        }
+
+        // Plugins são destruídos no thread de mensagens, como foram criados.
+        juce::MessageManager::callAsync ([offline = std::move (offline), created = std::move (created)] {});
+        jobPtr->finished = true;
+    });
+
+    renderJobs.push_back (std::move (job));
+}
+
+juce::var AudioEngine::cancelRender (const juce::var& message)
+{
+    for (auto& job : renderJobs)
+        if (job->name == message["job"].toString())
+            job->cancel = true;
+    return true;
 }
 
 //==============================================================================

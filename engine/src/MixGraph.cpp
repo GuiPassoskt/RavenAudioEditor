@@ -47,6 +47,9 @@ void TrackState::prepare (double rate, int maxBlockSize)
     delayLine.setSize (2, (int) rate + 1);
     delayLine.clear();
     delayIndex = 0;
+    busDelayLine.setSize (2, (int) rate + 1);
+    busDelayLine.clear();
+    busDelayIndex = 0;
 }
 
 //==============================================================================
@@ -56,10 +59,22 @@ MixGraph::Ptr MixGraph::build (const juce::var& project, double rate, bool apply
     graph->sampleRate = rate;
 
     const auto* tracks = project["tracks"].getArray();
+    // Barramentos não entram no solo ("solo safe"): o solo de uma faixa não cala o
+    // reverb compartilhado que ela alimenta.
     bool anySolo = false;
     if (tracks != nullptr)
         for (const auto& t : *tracks)
-            anySolo = anySolo || (bool) t["solo"];
+            anySolo = anySolo || ((bool) t["solo"] && t["kind"].toString() != "bus");
+
+    const auto envelope = [] (const juce::var& points)
+    {
+        std::vector<Track::Point> result;
+        if (auto* array = points.getArray())
+            for (const auto& p : *array)
+                result.push_back ({ (double) p["t"], (float) p["v"] });
+        std::sort (result.begin(), result.end(), [] (const auto& a, const auto& b) { return a.time < b.time; });
+        return result;
+    };
 
     if (tracks != nullptr)
     {
@@ -72,6 +87,7 @@ MixGraph::Ptr MixGraph::build (const juce::var& project, double rate, bool apply
             track.program = t["program"];
             track.drum = t["drum"];
             track.isMidi = t["kind"].toString() == "midi";
+            track.isBus = t["kind"].toString() == "bus";
 
             if (track.isMidi)
             {
@@ -83,11 +99,13 @@ MixGraph::Ptr MixGraph::build (const juce::var& project, double rate, bool apply
                 track.clip = resources.clip (t["clip"].toString());
 
             // channelVolumes() de buffer.js: pan linear do Audacity vezes o ganho em dB.
-            const bool audible = ! (bool) t["mute"] && (! anySolo || (bool) t["solo"]);
-            const float pan = t["pan"];
-            const float volume = dsp::dbToGain ((double) t["gain"]);
-            track.gainL = audible ? volume * (pan > 0 ? 1.0f - pan : 1.0f) : 0.0f;
-            track.gainR = audible ? volume * (pan < 0 ? 1.0f + pan : 1.0f) : 0.0f;
+            track.audible = ! (bool) t["mute"] && (track.isBus || ! anySolo || (bool) t["solo"]);
+            track.pan = t["pan"];
+            track.volume = dsp::dbToGain ((double) t["gain"]);
+            track.gainL = track.audible ? track.volume * (track.pan > 0 ? 1.0f - track.pan : 1.0f) : 0.0f;
+            track.gainR = track.audible ? track.volume * (track.pan < 0 ? 1.0f + track.pan : 1.0f) : 0.0f;
+            track.gainEnvelope = envelope (t["automation"]["gain"]);
+            track.panEnvelope = envelope (t["automation"]["pan"]);
 
             if (auto* effects = t["effects"].getArray())
                 for (const auto& fx : *effects)
@@ -97,6 +115,17 @@ MixGraph::Ptr MixGraph::build (const juce::var& project, double rate, bool apply
             graph->tracks.push_back (std::move (track));
         }
     }
+
+    // Envios: o id do barramento vira índice.
+    if (tracks != nullptr)
+        for (size_t i = 0; i < graph->tracks.size(); ++i)
+            if (auto* sends = (*tracks)[(int) i]["sends"].getArray())
+                for (const auto& s : *sends)
+                {
+                    const int bus = graph->trackIndex (s["bus"].toString());
+                    if (bus >= 0 && graph->tracks[(size_t) bus].isBus && ! graph->tracks[i].isBus)
+                        graph->tracks[i].sends.push_back ({ bus, dsp::dbToGain ((double) s["level"]) });
+                }
 
     // Compensação de latência: todas as faixas saem atrasadas como a mais lenta.
     const auto chainLatency = [] (const std::vector<RealtimeEffect::Ptr>& chain)
@@ -112,11 +141,19 @@ MixGraph::Ptr MixGraph::build (const juce::var& project, double rate, bool apply
         return chainLatency (t.effects) + (t.instrument != nullptr ? juce::jmax (0, t.instrument->getLatencySamples()) : 0);
     };
 
-    int slowest = 0;
+    // Faixas alinham entre si; o que passa por um barramento ainda leva a latência
+    // dele, então a saída direta das faixas espera a do barramento mais lento.
+    int slowest = 0, slowestBus = 0;
     for (const auto& t : graph->tracks)
-        slowest = juce::jmax (slowest, trackLatency (t));
+        (t.isBus ? slowestBus : slowest) = juce::jmax (t.isBus ? slowestBus : slowest, trackLatency (t));
     for (auto& t : graph->tracks)
-        t.compensation = juce::jmin (slowest - trackLatency (t), t.state->delayLine.getNumSamples() - 1);
+    {
+        const int limit = t.state->delayLine.getNumSamples() - 1;
+        t.compensation = juce::jmin ((t.isBus ? slowestBus : slowest) - trackLatency (t), limit);
+        t.busDelay = t.isBus ? 0 : juce::jmin (slowestBus, limit);
+        t.automationDelay = t.isBus ? slowest + slowestBus : slowest;
+    }
+    slowest += slowestBus;
 
     if (applyMaster)
     {
@@ -144,6 +181,8 @@ void MixGraph::locate (juce::int64)
         t.state->snapGains = true;
         t.state->delayLine.clear();
         t.state->delayIndex = 0;
+        t.state->busDelayLine.clear();
+        t.state->busDelayIndex = 0;
         t.state->panic = true;
         if (t.instrument != nullptr)
             t.instrument->reset();
@@ -291,12 +330,108 @@ void MixGraph::scheduleNotes (Track& t, int numSamples, juce::int64 position, ju
     st.expectedPosition = position + numSamples;
 }
 
+// Atraso em linha (até 1 s) usado na compensação de latência.
+static void delayBuffer (juce::AudioBuffer<float>& buf, juce::AudioBuffer<float>& line, int& index, int delay, int numSamples)
+{
+    if (delay <= 0)
+        return;
+
+    const int size = line.getNumSamples();
+    for (int c = 0; c < 2; ++c)
+    {
+        auto* d = line.getWritePointer (c);
+        auto* x = buf.getWritePointer (c);
+        int w = index;
+        for (int i = 0; i < numSamples; ++i)
+        {
+            d[w] = x[i];
+            x[i] = d[(w - delay + size) % size];
+            w = (w + 1) % size;
+        }
+    }
+    index = (index + numSamples) % size;
+}
+
+// Interpolação linear entre os pontos; antes do primeiro e depois do último, o valor deles.
+static float envelopeAt (const std::vector<MixGraph::Track::Point>& points, double time)
+{
+    if (time <= points.front().time) return points.front().value;
+    if (time >= points.back().time) return points.back().value;
+    const auto next = std::upper_bound (points.begin(), points.end(), time,
+                                        [] (double x, const auto& p) { return x < p.time; });
+    const auto prev = next - 1;
+    const double f = (time - prev->time) / (next->time - prev->time);
+    return (float) (prev->value + (next->value - prev->value) * f);
+}
+
+// Efeitos, compensação, ganho/pan (com automação) e medidores de uma faixa ou barramento.
+void MixGraph::finishTrack (Track& t, int numSamples, juce::int64 position)
+{
+    auto& st = *t.state;
+    auto& buf = st.scratch;
+
+    for (auto& fx : t.effects)
+        fx->process (buf, numSamples);
+
+    delayBuffer (buf, st.delayLine, st.delayIndex, t.compensation, numSamples);
+
+    const bool automated = ! t.gainEnvelope.empty() || ! t.panEnvelope.empty();
+    const auto targetsAt = [&] (juce::int64 sample)
+    {
+        if (! automated)
+            return std::pair<float, float> { t.gainL, t.gainR };
+        if (! t.audible)
+            return std::pair<float, float> { 0.0f, 0.0f };
+
+        const double time = (double) (sample - t.automationDelay) / sampleRate - t.offset;
+        const float volume = t.gainEnvelope.empty() ? t.volume : t.volume * dsp::dbToGain (envelopeAt (t.gainEnvelope, time));
+        const float pan = t.panEnvelope.empty() ? t.pan : juce::jlimit (-1.0f, 1.0f, envelopeAt (t.panEnvelope, time));
+        return std::pair<float, float> { volume * (pan > 0 ? 1.0f - pan : 1.0f), volume * (pan < 0 ? 1.0f + pan : 1.0f) };
+    };
+
+    if (st.snapGains)
+    {
+        const auto [gl, gr] = targetsAt (position);
+        st.gainL.snap (gl);
+        st.gainR.snap (gr);
+        st.snapGains = false;
+    }
+
+    auto* l = buf.getWritePointer (0);
+    auto* r = buf.getWritePointer (1);
+    float peakL = 0, peakR = 0;
+    for (int i = 0; i < numSamples; ++i)
+    {
+        if (i % 32 == 0)
+        {
+            const auto [gl, gr] = targetsAt (position + i);
+            st.gainL.target = gl;
+            st.gainR.target = gr;
+        }
+        l[i] *= st.gainL.next();
+        r[i] *= st.gainR.next();
+        peakL = juce::jmax (peakL, std::abs (l[i]));
+        peakR = juce::jmax (peakR, std::abs (r[i]));
+    }
+
+    if (peakL > st.peakL.load (std::memory_order_relaxed)) st.peakL.store (peakL, std::memory_order_relaxed);
+    if (peakR > st.peakR.load (std::memory_order_relaxed)) st.peakR.store (peakR, std::memory_order_relaxed);
+}
+
 void MixGraph::render (juce::AudioBuffer<float>& out, int numSamples, juce::int64 position, juce::int64 end,
                        MasterState& master, bool running, const juce::MidiBuffer* midiInput)
 {
+    // Barramentos começam vazios: as faixas somam os envios neles.
+    for (auto& t : tracks)
+        if (t.isBus)
+            t.state->scratch.clear (0, numSamples);
+
     for (size_t index = 0; index < tracks.size(); ++index)
     {
         auto& t = tracks[index];
+        if (t.isBus)
+            continue;
+
         auto& st = *t.state;
         auto& buf = st.scratch;
         buf.clear (0, numSamples);
@@ -342,53 +477,26 @@ void MixGraph::render (juce::AudioBuffer<float>& out, int numSamples, juce::int6
             }
         }
 
-        for (auto& fx : t.effects)
-            fx->process (buf, numSamples);
+        finishTrack (t, numSamples, position);
 
-        if (t.compensation > 0)
-        {
-            auto& line = st.delayLine;
-            const int size = line.getNumSamples();
+        // Envios pós-fader para os barramentos.
+        for (const auto& send : t.sends)
             for (int c = 0; c < 2; ++c)
-            {
-                auto* d = line.getWritePointer (c);
-                auto* x = buf.getWritePointer (c);
-                int w = st.delayIndex;
-                for (int i = 0; i < numSamples; ++i)
-                {
-                    d[w] = x[i];
-                    x[i] = d[(w - t.compensation + size) % size];
-                    w = (w + 1) % size;
-                }
-            }
-            st.delayIndex = (st.delayIndex + numSamples) % size;
-        }
+                tracks[(size_t) send.bus].state->scratch.addFrom (c, 0, buf, c, 0, numSamples, send.gain);
 
-        st.gainL.target = t.gainL;
-        st.gainR.target = t.gainR;
-        if (st.snapGains)
-        {
-            st.gainL.snap (t.gainL);
-            st.gainR.snap (t.gainR);
-            st.snapGains = false;
-        }
-
-        auto* l = buf.getWritePointer (0);
-        auto* r = buf.getWritePointer (1);
-        float peakL = 0, peakR = 0;
-        for (int i = 0; i < numSamples; ++i)
-        {
-            l[i] *= st.gainL.next();
-            r[i] *= st.gainR.next();
-            peakL = juce::jmax (peakL, std::abs (l[i]));
-            peakR = juce::jmax (peakR, std::abs (r[i]));
-        }
-
-        if (peakL > st.peakL.load (std::memory_order_relaxed)) st.peakL.store (peakL, std::memory_order_relaxed);
-        if (peakR > st.peakR.load (std::memory_order_relaxed)) st.peakR.store (peakR, std::memory_order_relaxed);
-
+        delayBuffer (buf, st.busDelayLine, st.busDelayIndex, t.busDelay, numSamples);
         out.addFrom (0, 0, buf, 0, 0, numSamples);
         out.addFrom (1, 0, buf, 1, 0, numSamples);
+    }
+
+    for (auto& t : tracks)
+    {
+        if (! t.isBus)
+            continue;
+
+        finishTrack (t, numSamples, position);
+        out.addFrom (0, 0, t.state->scratch, 0, 0, numSamples);
+        out.addFrom (1, 0, t.state->scratch, 1, 0, numSamples);
     }
 
     for (auto& fx : masterEffects)

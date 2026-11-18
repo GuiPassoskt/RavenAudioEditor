@@ -7,12 +7,15 @@
 // Grafo (o mesmo ao vivo e no OfflineAudioContext da exportação):
 //
 //   faixa: BufferSource -> [efeitos da faixa] -> upmix(2) -> Splitter -> gainL/gainR -> Merger ─┐
+//                                                                     └─ envio (Gain) -> barramento
+//   barramento: Σ envios -> [efeitos] -> upmix(2) -> Splitter -> gainL/gainR -> Merger ───────┤
 //   master: Σ faixas -> [efeitos master] -> fader master -> saída / medidores <───────────────┘
 //
-// O par gainL/gainR aplica a lei de pan linear do Audacity (ver buffer.channelVolumes),
-// e a ordem faixa → master segue o RealtimeEffectManager.
+// O par gainL/gainR aplica a lei de pan linear do Audacity (ver buffer.channelVolumes)
+// e a automação (automation.js), e a ordem faixa → master segue o RealtimeEffectManager.
 
 import { channelVolumes, dbToLinear } from './buffer.js'
+import { automationRamps, hasAutomation } from './automation.js'
 import { createNativeEngine } from './engine-native.js'
 import { buildChain, chainSignature } from './realtime.js'
 import { playNote } from './synth.js'
@@ -20,7 +23,14 @@ import { playNote } from './synth.js'
 const LEAD = 0.05 // segundos de antecedência no agendamento
 const MIDI_LOOKAHEAD = 0.3 // notas MIDI são agendadas aos poucos, 300 ms à frente
 
-export const trackDuration = (track, rate) => (track.kind === 'midi' ? track.length : track.channels[0].length / rate)
+export const trackDuration = (track, rate) => {
+  if (track.kind === 'midi') return track.length
+  if (track.kind === 'bus') return 0
+  return track.channels[0].length / rate
+}
+
+// Envios só mudam o grafo quando o conjunto de barramentos muda; o nível é ajustado ao vivo.
+const sendSignature = track => (track.sends ?? []).map(s => s.bus).join(',')
 
 const RECORDER_WORKLET = `
 class RecorderProcessor extends AudioWorkletProcessor {
@@ -62,7 +72,7 @@ function createVoice (ctx, track, destination, withMeter) {
   gl.connect(merger, 0, 0)
   gr.connect(merger, 0, 1)
   merger.connect(destination)
-  const voice = { chain, gl, gr, merger, sig: chainSignature(track.effects ?? []), sources: [], meters: null }
+  const voice = { chain, gl, gr, merger, sig: chainSignature(track.effects ?? []), sendSig: sendSignature(track), sends: new Map(), sources: [], meters: null }
   if (withMeter) voice.meters = attachMeters(ctx, merger)
   return voice
 }
@@ -89,7 +99,21 @@ function buildGraph (ctx, { tracks, rate, t0, t1, startAt, master, applyMaster =
 
   const voices = new Map()
   const midi = []
+  // Barramentos primeiro: as faixas ligam os envios na entrada deles.
   for (const track of tracks) {
+    if (track.kind === 'bus') voices.set(track.id, createVoice(ctx, track, masterIn, meters))
+  }
+  const connectSends = (track, voice) => {
+    for (const s of track.sends ?? []) {
+      const bus = voices.get(s.bus)
+      if (!bus || voice.sends.has(s.bus)) continue
+      const send = new GainNode(ctx, { gain: dbToLinear(s.level) })
+      voice.merger.connect(send).connect(bus.chain.input)
+      voice.sends.set(s.bus, send)
+    }
+  }
+  for (const track of tracks) {
+    if (track.kind === 'bus') continue
     if (track.kind === 'midi') {
       // Faixa MIDI: as notas tocam no sintetizador e entram na cadeia de efeitos da faixa.
       const notes = track.notes
@@ -99,6 +123,7 @@ function buildGraph (ctx, { tracks, rate, t0, t1, startAt, master, applyMaster =
       if (!notes.length) continue
       const voice = createVoice(ctx, track, masterIn, meters)
       voices.set(track.id, voice)
+      connectSends(track, voice)
       midi.push({ voice, track, notes, idx: 0 })
       continue
     }
@@ -112,6 +137,7 @@ function buildGraph (ctx, { tracks, rate, t0, t1, startAt, master, applyMaster =
     src.start(startAt + (segStart - t0), segStart - track.offset, segEnd - segStart)
     voice.sources.push(src)
     voices.set(track.id, voice)
+    connectSends(track, voice)
   }
   const graph = { masterIn, masterChain, fader, voices, midi, t0, t1, startAt, masterSig: chainSignature(applyMaster ? master.effects : []) }
   // Offline agenda tudo de uma vez; ao vivo, o agendador do motor vai agendando.
@@ -125,18 +151,29 @@ function buildGraph (ctx, { tracks, rate, t0, t1, startAt, master, applyMaster =
 function applyMix (graph, tracks, master, applyMaster = true, immediate = false) {
   const ctx = graph.fader.context
   const set = (param, v) => {
-    if (immediate || ctx instanceof OfflineAudioContext) param.value = v
-    else param.setTargetAtTime(v, ctx.currentTime, 0.01)
+    if (immediate || ctx instanceof OfflineAudioContext) {
+      param.value = v
+    } else {
+      param.cancelScheduledValues(0) // a faixa pode ter tido automação
+      param.setTargetAtTime(v, ctx.currentTime, 0.01)
+    }
   }
   let structureOk = true
-  const anySolo = tracks.some(t => t.solo)
+  // Barramentos não entram no solo: o solo de uma faixa não cala o reverb que ela alimenta.
+  const anySolo = tracks.some(t => t.solo && t.kind !== 'bus')
   for (const track of tracks) {
     const v = graph.voices.get(track.id)
     if (!v) continue
-    const audible = !track.mute && (!anySolo || track.solo)
-    const [l, r] = audible ? channelVolumes(track) : [0, 0]
-    set(v.gl.gain, l)
-    set(v.gr.gain, r)
+    const audible = !track.mute && (track.kind === 'bus' || !anySolo || track.solo)
+    if (audible && hasAutomation(track)) {
+      scheduleAutomation(graph, v, track, immediate)
+    } else {
+      const [l, r] = audible ? channelVolumes(track) : [0, 0]
+      set(v.gl.gain, l)
+      set(v.gr.gain, r)
+    }
+    if (sendSignature(track) !== v.sendSig) structureOk = false
+    else for (const s of track.sends ?? []) if (v.sends.has(s.bus)) set(v.sends.get(s.bus).gain, dbToLinear(s.level))
     if (immediate) continue
     if (chainSignature(track.effects ?? []) !== v.sig) structureOk = false
     else for (const fx of track.effects ?? []) v.chain.slots.get(fx.uid)?.update(fx.params, fx.enabled)
@@ -147,6 +184,21 @@ function applyMix (graph, tracks, master, applyMaster = true, immediate = false)
     else for (const fx of master.effects) graph.masterChain.slots.get(fx.uid)?.update(fx.params, fx.enabled)
   }
   return structureOk
+}
+
+// Automação: rampas nos ganhos L/R do ponto atual até o fim do trecho tocado.
+function scheduleAutomation (graph, voice, track, immediate) {
+  const ctx = graph.fader.context
+  const now = immediate ? graph.startAt : Math.max(ctx.currentTime, graph.startAt)
+  const from = graph.t0 + (now - graph.startAt)
+  if (from >= graph.t1) return
+  const toCtx = T => graph.startAt + (T - graph.t0)
+  const ramps = automationRamps(track, from, graph.t1)
+  for (const [param, key] of [[voice.gl.gain, 'l'], [voice.gr.gain, 'r']]) {
+    param.cancelScheduledValues(0)
+    param.setValueAtTime(ramps[0][key], now)
+    for (const p of ramps.slice(1)) param.linearRampToValueAtTime(p[key], toCtx(p.T))
+  }
 }
 
 // Agenda as notas cujo início cai antes de `horizon` (tempo do contexto).
@@ -278,13 +330,31 @@ class AudioEngine {
   }
 
   // Renderiza a mixagem com todos os efeitos em tempo real (exportação,
-  // "Mixar e renderizar", "Aplicar efeitos na faixa").
-  async render ({ tracks, rate, t0, t1, master, applyMaster = true, channels = 2 }) {
+  // "Mixar e renderizar", "Aplicar efeitos na faixa", congelar). onProgress(0..1)
+  // e signal (AbortController) para exportar em segundo plano.
+  async render ({ tracks, rate, t0, t1, master, applyMaster = true, channels = 2, onProgress, signal }) {
     const length = Math.max(1, Math.round((t1 - t0) * rate))
     const ctx = new OfflineAudioContext(2, length, rate)
     const graph = buildGraph(ctx, { tracks, rate, t0, t1, startAt: 0, master, applyMaster })
     graph.fader.connect(ctx.destination)
-    const rendered = await ctx.startRendering()
+    const rendered = await new Promise((resolve, reject) => {
+      // O OfflineAudioContext não tem como cancelar: ele para numa pausa e fica lá.
+      const cancelled = () => reject(new Error('Render cancelado.'))
+      if (signal?.aborted) return cancelled()
+      signal?.addEventListener('abort', cancelled)
+      const steps = new Set()
+      for (let i = 1; i < 20; i++) steps.add(Math.floor((length * i) / 20 / 128) * 128)
+      for (const frame of steps) {
+        if (frame <= 0 || frame >= length) continue
+        ctx.suspend(frame / rate).then(() => {
+          if (signal?.aborted) return
+          onProgress?.(frame / length)
+          ctx.resume()
+        })
+      }
+      ctx.startRendering().then(resolve, reject)
+    })
+    onProgress?.(1)
     const l = rendered.getChannelData(0)
     const r = rendered.getChannelData(1)
     if (channels === 2) return [new Float32Array(l), new Float32Array(r)]

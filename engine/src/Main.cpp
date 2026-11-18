@@ -81,6 +81,12 @@ private:
 
         try
         {
+            if (cmd == "render.offline")
+            {
+                audio->renderOffline (id, message);  // responde quando o render terminar
+                return;
+            }
+
             if (raven::AudioEngine::handles (cmd))
             {
                 raven::sendResult (id, audio->handle (cmd, message));

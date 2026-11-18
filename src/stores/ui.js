@@ -12,6 +12,7 @@ export const useUiStore = defineStore('ui', {
     mixerOpen: false, // Mesa de som (MixerBoard)
     pianoRoll: null, // id da faixa MIDI aberta no piano roll
     fxTarget: null, // painel de efeitos em tempo real: id da faixa ou 'master'
+    envelopeParam: 'gain', // automação editada pela ferramenta de envelope: 'gain' | 'pan'
     shortcutsOpen: false,
     aboutOpen: false,
     splashOpen: false // tela de abertura com informações técnicas
