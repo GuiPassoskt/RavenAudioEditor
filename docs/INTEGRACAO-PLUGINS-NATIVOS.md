@@ -311,7 +311,7 @@ nele em fases. A Fase 1 usa esse mesmo processo só para aplicar efeitos (Opçã
 | 2 ✅ | **Motor nativo** de reprodução e mixagem (I/O nativo, grafo, transporte). O Web Audio sai do app desktop (seção 4.6) | Nativo | Concluída |
 | 3 ✅ | Plugins **em tempo real** nas cadeias de faixa e master, mais as janelas nativas dos plugins (seção 4.7) | Nativo | Concluída |
 | 4 ✅ | Instrumentos virtuais (VSTi) nas faixas MIDI, entrada MIDI de hardware, gravação com compensação de latência (seção 4.8) | Nativo | Concluída |
-| 5 🟡 | Recursos de DAW: automação, envios/barramentos, congelar faixa e render em segundo plano feitos (seção 4.9); falta **clips** (vários trechos por faixa) | Nativo | Em andamento |
+| 5 ✅ | Recursos de DAW: automação, clips, envios/barramentos, congelar faixa, render em segundo plano (seção 4.9) | Nativo | Concluída |
 
 ```mermaid
 flowchart LR
@@ -320,7 +320,7 @@ flowchart LR
   F2["Fase 2 ✅<br/>Motor nativo<br/>I/O, grafo, transporte"]
   F3["Fase 3 ✅<br/>Plugins em tempo real<br/>janelas nativas"]
   F4["Fase 4 ✅<br/>VSTi, MIDI de hardware,<br/>latência de gravação"]
-  F5["Fase 5 🟡<br/>DAW: automação, barramentos,<br/>congelar, render ✅ · clips"]
+  F5["Fase 5 ✅<br/>DAW: automação, clips,<br/>barramentos, congelar"]
   F0 --> F1 --> F2 --> F3 --> F4 --> F5
 
   WA[["Motor Web Audio atual"]] -. "ainda em uso" .- F0
@@ -806,9 +806,32 @@ Dispositivos de áudio → Gravação), para o take ficar alinhado com o que se 
 
 ### 4.9 Fase 5: recursos de DAW (como está implementado)
 
-Quatro dos cinco itens. **Clips** (vários trechos independentes numa faixa, cada um
-com posição e corte próprios) ficam para uma etapa à parte, porque mudam o modelo
-de dados da faixa, a edição e o desenho.
+**Clips.** Uma faixa de áudio pode ter vários clipes, como os WaveClip do Audacity.
+No menu **Editar**: **Dividir clipe** (Ctrl+I, no cursor ou nas bordas da seleção),
+**Juntar clipes** (Ctrl+J, os que a seleção tocar; o vão entre eles vira silêncio do
+clipe) e **Excluir deixando vão** (Ctrl+Alt+K, tira a seleção sem puxar o resto).
+Com a ferramenta de mover (F5), numa faixa com mais de um clipe, arrasta-se só o
+clipe (um contorno mostra a posição nova; ele para nos vizinhos); com um clipe só,
+a faixa inteira anda, como antes. Duplo clique num clipe seleciona o clipe.
+
+- **Modelo:** o áudio da faixa continua num buffer só (`channels` a partir de
+  `offset`) e os clipes são regiões dele em amostras, `clips: [{ s0, s1 }]`, em
+  ordem e sem sobreposição. **Fora dos clipes o buffer é silêncio**, por isso os
+  dois motores, a exportação, o congelamento e a gravação não mudaram.
+  O custo é que um vão ocupa memória como silêncio.
+- Toda edição atualiza os clipes junto com o buffer (`src/audio/clips.js`, funções
+  puras): excluir puxa os clipes seguintes; colar dentro de um clipe o aumenta e,
+  num vão, cria um clipe (o que foi copiado com vários clipes chega com eles);
+  gravar por cima junta com os clipes que o take tocar; aparar e trocar a taxa
+  ajustam as regiões. Mover um clipe e excluir deixando vão cortam o silêncio que
+  sobra nas pontas do buffer.
+- **Efeitos destrutivos:** com seleção, o trecho dela (os clipes que ele toca viram um
+  só, porque o resultado pode ter som no vão, como a cauda de um eco); sem seleção,
+  cada clipe separado. "Aplicar na faixa" (cadeia em tempo real) descarta o que cai
+  nos vãos.
+- Faixas MIDI continuam com uma região só (as notas já são independentes).
+- No `.ravenproj`, `clips: [[s0, s1], …]`; projetos de antes abrem com o buffer
+  inteiro como um clipe.
 
 **Envios e barramentos.** **Faixas → Novo barramento** cria uma faixa sem conteúdo
 (`kind: 'bus'`) que recebe envios; ela tem efeitos, volume, pan, mudo e solo como
@@ -893,6 +916,9 @@ editar enquanto exporta. A exportação usa o projeto como estava ao começar.
 | Render de 1 min com dois reverbs de 10 s | motor respondeu ao ping em 0 ms durante os 27 s de render; 125 eventos de progresso |
 | Cancelar render / exportação pela interface | erro "Render cancelado." em 29 ms / aviso "Exportação cancelada" |
 | Projeto com barramento salvo e aberto | envio religado ao barramento novo |
+| Dividir, excluir deixando vão, arrastar clipe, duplo clique, juntar e desfazer pela interface | clipes e seleção nas posições esperadas |
+| Render depois de mover um clipe | silêncio nos vãos, tom de 0,2 no clipe movido |
+| Efeito sem seleção, gerar num vão, gravar por cima, colar, excluir atravessando clipes, aparar, trocar a taxa | buffer em silêncio fora dos clipes em todos os passos |
 
 ### 4.10 Ambiente de desenvolvimento (Windows)
 

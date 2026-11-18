@@ -128,6 +128,9 @@ export function useCommands () {
     silence: { label: 'Silenciar áudio', icon: 'volume_off', keys: 'Ctrl+L', run: () => p.silence() },
     trim: { label: 'Aparar áudio (manter seleção)', icon: 'crop', keys: 'Ctrl+T', run: () => p.trim() },
     splitNew: { label: 'Dividir em nova faixa', icon: 'call_split', keys: 'Ctrl+Alt+I', run: () => p.splitNew() },
+    splitClip: { label: 'Dividir clipe', icon: 'mdi-content-cut', keys: 'Ctrl+I', run: () => p.splitClip() },
+    joinClips: { label: 'Juntar clipes', icon: 'mdi-link-variant', keys: 'Ctrl+J', run: () => p.joinClips() },
+    splitDelete: { label: 'Excluir deixando vão', icon: 'mdi-select-remove', keys: 'Ctrl+Alt+K', run: () => p.splitDelete() },
     history: { label: 'Histórico…', icon: 'history', keys: 'Ctrl+H', run: () => { ui.historyOpen = !ui.historyOpen } },
 
     // Selecionar
@@ -242,7 +245,7 @@ export function useCommands () {
 
   const menus = [
     { label: 'Arquivo', items: ['newProject', 'openProject', 'saveProject', '-', 'importAudio', 'importMidi', '-', 'exportWav', 'exportWavFloat', 'exportSelection', 'exportMidi'] },
-    { label: 'Editar', items: ['undo', 'redo', '-', 'cut', 'copy', 'paste', 'remove', '-', 'duplicate', 'silence', 'trim', 'splitNew', '-', 'history'] },
+    { label: 'Editar', items: ['undo', 'redo', '-', 'cut', 'copy', 'paste', 'remove', '-', 'duplicate', 'silence', 'trim', 'splitNew', '-', 'splitClip', 'joinClips', 'splitDelete', '-', 'history'] },
     { label: 'Selecionar', items: ['selectAll', 'selectNone', 'selectAllTracks', '-', 'selectStartToCursor', 'selectCursorToEnd'] },
     { label: 'Exibir', items: ['zoomIn', 'zoomNormal', 'zoomOut', 'zoomSel', 'zoomFit', '-', 'mixer', 'pianoRoll', 'history'] },
     { label: 'Transporte', items: ['playStop', 'pause', 'stop', 'record', '-', 'skipStart', 'skipEnd', 'loop', ...(hasNativeEngine ? ['-', 'audioDevices'] : [])] },

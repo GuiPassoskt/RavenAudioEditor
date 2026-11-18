@@ -41,6 +41,7 @@ const canvas = ref(null)
 let frame = 0
 let observer = null
 let colors = null
+let ghost = null // { t0, t1 } do clipe arrastado com a ferramenta de mover
 
 function readColors () {
   const css = getComputedStyle(document.documentElement)
@@ -82,17 +83,20 @@ function draw () {
   const isMidi = track.kind === 'midi'
   const isBus = track.kind === 'bus'
   const len = track.kind === 'audio' ? track.channels[0].length : 0
-  const rawX0 = xOf(track.offset)
-  const rawX1 = xOf(track.offset + trackDuration(track, rate))
-  const clipX0 = Math.max(0, rawX0)
-  const clipX1 = Math.min(w, rawX1)
-  const hasClip = clipX1 > clipX0 && (isMidi ? track.notes.length > 0 : len > 0)
-  if (hasClip) {
+  // Clips em pixels: no áudio, as regiões do buffer (clips.js); no MIDI, a faixa
+  // inteira, se tiver notas.
+  const regions = track.kind === 'audio'
+    ? track.clips.map(c => [xOf(track.offset + c.s0 / rate), xOf(track.offset + c.s1 / rate)])
+    : isMidi && track.notes.length ? [[xOf(track.offset), xOf(track.offset + trackDuration(track, rate))]] : []
+  const visible = regions.filter(([a, b]) => b > 0 && a < w)
+  const hasClip = visible.length > 0
+  const frozen = isFrozen(track)
+  for (const [rawX0, rawX1] of visible) {
     const x = Math.max(-4, rawX0) + 1
-    const cw = Math.min(w + 4, rawX1) - x - 1
+    const cw = Math.max(1, Math.min(w + 4, rawX1) - x - 1)
     g.save()
     g.beginPath()
-    g.roundRect(x, 2, cw, h - 4, 4)
+    g.roundRect(x, 2, cw, h - 4, Math.min(4, cw / 2))
     g.fillStyle = rgba(color, track.selected ? 0.34 : 0.22)
     g.fill()
     g.strokeStyle = rgba(color, track.selected ? 1 : 0.75)
@@ -105,13 +109,22 @@ function draw () {
     g.fillStyle = textOn(color)
     g.font = '600 11px Roboto, sans-serif'
     g.textBaseline = 'middle'
-    g.fillText(isFrozen(track) ? `❄ ${track.name} (congelada)` : track.name, Math.max(x, 0) + 6, 2 + CLIP_HEADER / 2 + 0.5)
+    g.fillText(frozen ? `❄ ${track.name} (congelada)` : track.name, Math.max(x, 0) + 6, 2 + CLIP_HEADER / 2 + 0.5)
     g.textBaseline = 'alphabetic'
     // Congelada: um véu frio sobre o clipe.
-    if (isFrozen(track)) {
+    if (frozen) {
       g.fillStyle = 'rgba(160, 210, 255, 0.10)'
       g.fillRect(x, 2 + CLIP_HEADER, cw, h - 4 - CLIP_HEADER)
     }
+    g.restore()
+  }
+  // Clipe sendo arrastado com a ferramenta de mover: contorno na posição nova.
+  if (ghost) {
+    const a = xOf(ghost.t0)
+    g.save()
+    g.strokeStyle = colors.cursor
+    g.setLineDash([4, 3])
+    g.strokeRect(a + 0.5, 2.5, Math.max(1, (ghost.t1 - ghost.t0) * pps - 1), h - 5)
     g.restore()
   }
   if (isBus) {
@@ -139,7 +152,10 @@ function draw () {
     }
   }
 
-  if (isMidi) drawNotes(g, w, top0, contentH, xOf, color, clipX0, clipX1)
+  if (isMidi) {
+    const [mx0, mx1] = visible[0] ?? [0, 0]
+    drawNotes(g, w, top0, contentH, xOf, color, Math.max(0, mx0), Math.min(w, mx1))
+  }
 
   const nCh = Math.max(1, track.channels.length)
   const laneH = contentH / nCh
@@ -150,56 +166,58 @@ function draw () {
     const mid = top + laneH / 2
     const half = laneH / 2 - 2
 
-    // Linhas de guia só dentro do clip.
-    g.fillStyle = axisColor
-    if (hasClip) {
+    // Só dentro dos clips: fora deles o buffer é silêncio.
+    for (const [rx0, rx1] of visible) {
+      const clipX0 = Math.max(0, rx0)
+      const clipX1 = Math.min(w, rx1)
+      g.fillStyle = axisColor
       g.fillRect(clipX0, Math.round(mid), clipX1 - clipX0, 1)
       if (c > 0) g.fillRect(clipX0, Math.round(top), clipX1 - clipX0, 1)
-    }
-    if (!len) return
+      if (!len) continue
 
-    const firstX = Math.max(0, Math.floor(clipX0))
-    const lastX = Math.min(w, Math.ceil(clipX1))
+      const firstX = Math.max(0, Math.floor(clipX0))
+      const lastX = Math.min(w, Math.ceil(clipX1))
 
-    if (spp > 1) {
-      for (let x = firstX; x < lastX; x++) {
-        const a = (scrollTime + x / pps - track.offset) * rate
-        const st = rangeStats(ch, a, a + spp)
-        if (!st) continue
-        const yMax = mid - Math.min(1, st.max) * half
-        const yMin = mid - Math.max(-1, st.min) * half
-        g.fillStyle = waveColor
-        g.fillRect(x, yMax, 1, Math.max(1, yMin - yMax))
-        const r = Math.min(st.rms, Math.max(st.max, 0), Math.max(-st.min, 0))
-        if (r > 0) {
-          g.fillStyle = rmsColor
-          g.fillRect(x, mid - r * half, 1, Math.max(1, 2 * r * half))
+      if (spp > 1) {
+        for (let x = firstX; x < lastX; x++) {
+          const a = (scrollTime + x / pps - track.offset) * rate
+          const st = rangeStats(ch, a, a + spp)
+          if (!st) continue
+          const yMax = mid - Math.min(1, st.max) * half
+          const yMin = mid - Math.max(-1, st.min) * half
+          g.fillStyle = waveColor
+          g.fillRect(x, yMax, 1, Math.max(1, yMin - yMax))
+          const r = Math.min(st.rms, Math.max(st.max, 0), Math.max(-st.min, 0))
+          if (r > 0) {
+            g.fillStyle = rmsColor
+            g.fillRect(x, mid - r * half, 1, Math.max(1, 2 * r * half))
+          }
+          if (st.max >= 1 || st.min <= -1) {
+            g.fillStyle = colors.clipping
+            g.fillRect(x, top, 1, laneH)
+          }
         }
-        if (st.max >= 1 || st.min <= -1) {
-          g.fillStyle = colors.clipping
-          g.fillRect(x, top, 1, laneH)
-        }
-      }
-    } else {
-      // Zoom no nível de amostra: polilinha (e pontos quando há espaço).
-      const s0 = Math.max(0, Math.floor((scrollTime - track.offset) * rate) - 1)
-      const s1 = Math.min(len, Math.ceil((scrollTime + w / pps - track.offset) * rate) + 1)
-      g.strokeStyle = rmsColor
-      g.lineWidth = 1.25
-      g.beginPath()
-      for (let i = s0; i < s1; i++) {
-        const x = xOf(track.offset + i / rate)
-        const y = mid - Math.max(-1, Math.min(1, ch[i])) * half
-        if (i === s0) g.moveTo(x, y)
-        else g.lineTo(x, y)
-      }
-      g.stroke()
-      if (pps / rate > 6) {
-        g.fillStyle = shade(color, 0.85)
+      } else {
+        // Zoom no nível de amostra: polilinha (e pontos quando há espaço).
+        const s0 = Math.max(0, Math.floor((scrollTime + clipX0 / pps - track.offset) * rate) - 1)
+        const s1 = Math.min(len, Math.ceil((scrollTime + clipX1 / pps - track.offset) * rate) + 1)
+        g.strokeStyle = rmsColor
+        g.lineWidth = 1.25
+        g.beginPath()
         for (let i = s0; i < s1; i++) {
           const x = xOf(track.offset + i / rate)
           const y = mid - Math.max(-1, Math.min(1, ch[i])) * half
-          g.fillRect(x - 2, y - 2, 4, 4)
+          if (i === s0) g.moveTo(x, y)
+          else g.lineTo(x, y)
+        }
+        g.stroke()
+        if (pps / rate > 6) {
+          g.fillStyle = shade(color, 0.85)
+          for (let i = s0; i < s1; i++) {
+            const x = xOf(track.offset + i / rate)
+            const y = mid - Math.max(-1, Math.min(1, ch[i])) * half
+            g.fillRect(x - 2, y - 2, 4, 4)
+          }
         }
       }
     }
@@ -442,6 +460,30 @@ function onPointerDown (e) {
     return
   }
 
+  if (store.tool === 'shift' && track.kind === 'audio' && track.clips.length > 1) {
+    store.selectTrack(track.id, e.ctrlKey || e.metaKey)
+    const clip = store.clipAtTime(track, t)
+    if (!clip) return
+    const startX = e.clientX
+    const dur = clip.t1 - clip.t0
+    onMove = ev => {
+      const t0 = Math.max(0, clip.t0 + (ev.clientX - startX) / store.pps)
+      ghost = { t0, t1: t0 + dur }
+      scheduleDraw()
+    }
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      const to = ghost?.t0
+      ghost = null
+      scheduleDraw()
+      if (to !== undefined && to !== clip.t0) store.moveClip(track.id, clip.index, to)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    return
+  }
+
   if (store.tool === 'shift') {
     const startX = e.clientX
     const startOffset = track.offset
@@ -499,11 +541,13 @@ function onDoubleClick (e) {
   if (t.kind === 'bus') return
   if (t.kind === 'midi') { store.selectTrack(t.id); ui.pianoRoll = t.id; return }
   store.selectTrack(t.id)
-  store.setSelection(t.offset, store.trackEnd(t))
+  const clip = store.clipAtTime(t, timeAt(e.clientX))
+  if (clip) store.setSelection(clip.t0, clip.t1)
+  else store.setSelection(t.offset, store.trackEnd(t))
 }
 
 watch(
-  () => [props.track.version, props.track.offset, props.track.selected, props.track.channels, props.track.notes, props.track.color, props.track.name, store.recTake,
+  () => [props.track.version, props.track.offset, props.track.selected, props.track.channels, props.track.clips, props.track.notes, props.track.color, props.track.name, store.recTake,
     props.track.automation, props.track.frozen, props.track.effects, props.track.pan, store.tool, ui.envelopeParam,
     props.track.kind === 'bus' && store.tracks.map(t => t.sends),
     store.pps, store.scrollTime, store.sel.t0, store.sel.t1, store.rate, props.height],

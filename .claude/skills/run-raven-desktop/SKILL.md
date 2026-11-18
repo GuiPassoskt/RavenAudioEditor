@@ -1,6 +1,6 @@
 ---
 name: run-raven-desktop
-description: Abre e controla o app desktop do Raven Audio Editor (Electron + motor JUCE raven-engine) para testar de verdade a reprodução, a mixagem, os efeitos em tempo real, a gravação e os dispositivos de áudio do motor nativo, plugins VST3/LV2 nas cadeias em tempo real (estado, desfazer, janela nativa, compensação de latência), instrumentos virtuais (VSTi) nas faixas MIDI, entrada e gravação MIDI, compensação de latência da gravação, barramentos e envios, automação de volume/pan (ferramenta de envelope), congelar faixa, exportação em segundo plano, o fluxo Efeito → Plugin (VST3 / LV2)… e a tela Sobre. Use para rodar, testar, tirar prints ou confirmar uma mudança no app desktop, no motor (engine/), no motor de áudio nativo ou no diálogo de plugins.
+description: Abre e controla o app desktop do Raven Audio Editor (Electron + motor JUCE raven-engine) para testar de verdade a reprodução, a mixagem, os efeitos em tempo real, a gravação e os dispositivos de áudio do motor nativo, plugins VST3/LV2 nas cadeias em tempo real (estado, desfazer, janela nativa, compensação de latência), instrumentos virtuais (VSTi) nas faixas MIDI, entrada e gravação MIDI, compensação de latência da gravação, clipes (dividir, juntar, mover, excluir deixando vão), barramentos e envios, automação de volume/pan (ferramenta de envelope), congelar faixa, exportação em segundo plano, o fluxo Efeito → Plugin (VST3 / LV2)… e a tela Sobre. Use para rodar, testar, tirar prints ou confirmar uma mudança no app desktop, no motor (engine/), no motor de áudio nativo ou no diálogo de plugins.
 ---
 
 # Rodar e testar o Raven Audio Editor desktop
@@ -26,6 +26,9 @@ Arquivos desta skill:
   render seguindo a automação, congelar com o botão ❄ (editar descongela, desfazer congela),
   projeto com barramento salvo e aberto, exportação em segundo plano com progresso e
   Cancelar, 16 verificações (Fase 5).
+- `driver/clips-flow.mjs`: clipes pela interface (Editar → Dividir clipe, Ctrl+Alt+K, arrastar
+  com a ferramenta de mover, duplo clique, Ctrl+J, desfazer, render, duplicar, projeto),
+  9 verificações (Fase 5).
 - `driver/engine-mix.mjs`: barramentos, envios, solo seguro, PDC através do barramento,
   automação de volume e pan, render em segundo plano (motor livre, progresso, cancelar)
   no motor sozinho, 11 verificações.
@@ -111,6 +114,9 @@ Arquivos desta skill:
 - **Exportar pelo menu até o fim** baixa o arquivo, e o download do Electron pode abrir
   um diálogo nativo de salvar, que o CDP não alcança. O `mix-flow.mjs` cancela a
   exportação antes de terminar; para conferir o áudio, use `engine.render(...)` na página.
+- **Arrastar no canvas** precisa de `mousePressed`, vários `mouseMoved` e `mouseReleased`
+  (`c.send('Input.dispatchMouseEvent', …)`); o `clickAt` só clica. Duplo clique: o par
+  pressionar/soltar com `clickCount: 1` e depois com `clickCount: 2`.
 - A tela de abertura cobre os menus: feche com
   `pinia._s.get('ui').splashOpen = false` (o cenário já faz isso).
 
@@ -128,6 +134,7 @@ node .claude/skills/run-raven-desktop/driver/chain-flow.mjs ./raven-prints 9333
 node .claude/skills/run-raven-desktop/driver/instrument-flow.mjs ./raven-prints 9333
 node .claude/skills/run-raven-desktop/driver/midi-flow.mjs ./raven-prints 9333
 node .claude/skills/run-raven-desktop/driver/mix-flow.mjs ./raven-prints 9333
+node .claude/skills/run-raven-desktop/driver/clips-flow.mjs ./raven-prints 9333
 ```
 
 ## Caminho B: modo dev (testa o motor em `engine/bin/`)

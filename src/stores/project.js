@@ -11,6 +11,7 @@
 //   kind: 'bus' + sends     -> barramentos (aux) das DAWs: recebem envios das faixas
 //   automation              -> lib-wave-track Envelope (volume) e automação de pan
 //   frozen                  -> "congelar faixa" das DAWs: áudio pré-renderizado da cadeia
+//   clips                   -> lib-wave-track WaveClip (regiões do buffer da faixa, ver clips.js)
 
 import { defineStore } from 'pinia'
 import { markRaw, toRaw } from 'vue'
@@ -28,6 +29,7 @@ import {
   removeAutomationRange, shiftAutomation, trimAutomation
 } from 'src/audio/automation'
 import { nextTrackColor } from 'src/audio/colors'
+import * as C from 'src/audio/clips'
 
 const HISTORY_LIMIT = 200
 let nextId = 1
@@ -64,6 +66,8 @@ function makeTrack (props) {
     name: props.name ?? (midi ? 'Faixa MIDI' : bus ? 'Barramento' : 'Faixa de áudio'),
     color: props.color ?? nextTrackColor(),
     channels: markRaw(midi || bus ? [] : props.channels),
+    // Buffer com áudio sempre tem clips; sem lista (projeto antigo), é um clip só.
+    clips: midi || bus ? [] : C.normalizeClips(props.clips?.length ? props.clips : C.wholeClips(props.channels[0]?.length ?? 0), props.channels[0]?.length ?? 0),
     notes: markRaw(midi ? N.sortNotes([...(props.notes ?? [])]) : []),
     length: midi ? N.notesEnd(props.notes ?? []) : 0,
     program: props.program ?? 0,
@@ -99,8 +103,12 @@ function newInstrumentState ({ plugin, state = null }) {
   return { uid: nextFxUid++, type: 'plugin', enabled: true, plugin: { ...plugin }, state, stateVersion: nextStateVersion++ }
 }
 
-function setChannels (track, channels) {
+// Sem `clips`, os clips só ficam se a duração não mudou; senão o buffer vira um clip só.
+function setChannels (track, channels, clips) {
+  const length = channels[0]?.length ?? 0
+  if (!clips) clips = length === track.channels[0]?.length ? track.clips : C.wholeClips(length)
   track.channels = markRaw(channels)
+  track.clips = C.normalizeClips(clips, length)
   track.version = version++
 }
 
@@ -188,7 +196,9 @@ export const useProjectStore = defineStore('project', {
         const notes = N.clipNotes(track.notes, t0 - track.offset, t1 - track.offset)
         return { kind: 'midi', notes, program: track.program, drum: track.drum, duration: t1 - t0 }
       }
-      return { kind: 'audio', channels: this.extractChannels(track, t0, t1), duration: t1 - t0 }
+      const start = this.toSample(track, t0)
+      const n = Math.round((t1 - t0) * this.rate)
+      return { kind: 'audio', channels: this.extractChannels(track, t0, t1), clips: C.trimClips(track.clips, start, start + n), duration: t1 - t0 }
     },
 
     extractChannels (track, t0, t1) {
@@ -216,7 +226,7 @@ export const useProjectStore = defineStore('project', {
       } else {
         const [s0, s1] = this.clampedRange(track, t0, t1)
         if (s1 > s0) {
-          setChannels(track, track.channels.map(ch => removeRange(ch, s0, s1)))
+          setChannels(track, track.channels.map(ch => removeRange(ch, s0, s1)), C.removeClipRange(track.clips, s0, s1))
           track.automation = removeAutomationRange(track.automation, s0 / this.rate, s1 / this.rate)
         }
       }
@@ -243,8 +253,10 @@ export const useProjectStore = defineStore('project', {
       const data = fitChannels(clip.channels, track.channels.length)
       let s = this.toSample(track, t)
       let channels = track.channels
+      let clips = track.clips
       if (s < 0) {
         channels = channels.map(ch => concat([zeros(-s), ch]))
+        clips = C.shiftClips(clips, -s)
         track.automation = shiftAutomation(track.automation, -s / this.rate)
         track.offset = t
         s = 0
@@ -253,7 +265,13 @@ export const useProjectStore = defineStore('project', {
         track.offset = t
         s = 0
       }
-      setChannels(track, channels.map((ch, c) => insertAt(ch, s, data[c])))
+      const n = data[0].length
+      // O que veio com vários clips (copiado de outra faixa) mantém os clips.
+      const pasted = clip.clips
+      clips = pasted && !(pasted.length === 1 && pasted[0].s0 === 0 && pasted[0].s1 === n)
+        ? [...C.splitClips(clips, [s]).map(c => (c.s0 >= s ? { s0: c.s0 + n, s1: c.s1 + n } : c)), ...C.shiftClips(pasted, s)]
+        : C.insertClipRange(clips, s, n)
+      setChannels(track, channels.map((ch, c) => insertAt(ch, s, data[c])), clips)
       track.automation = insertAutomationGap(track.automation, s / this.rate, data[0].length / this.rate)
     },
 
@@ -277,7 +295,7 @@ export const useProjectStore = defineStore('project', {
       }
       const [s0, s1] = this.clampedRange(track, t0, t1)
       track.offset += s0 / this.rate
-      setChannels(track, track.channels.map(ch => ch.slice(s0, s1)))
+      setChannels(track, track.channels.map(ch => ch.slice(s0, s1)), C.trimClips(track.clips, s0, s1))
       track.automation = trimAutomation(track.automation, s0 / this.rate, s1 / this.rate)
     },
 
@@ -296,6 +314,7 @@ export const useProjectStore = defineStore('project', {
         tracks: this.tracks.map(t => ({ ...toRaw(t) })),
         master: { ...toRaw(this.master) },
         tempo: this.tempo,
+        rate: this.rate, // desfazer a troca de taxa volta as amostras e a taxa juntas
         sel: { ...this.sel }
       }
     },
@@ -304,6 +323,7 @@ export const useProjectStore = defineStore('project', {
       this.tracks = state.tracks.map(t => ({ ...t, channels: markRaw(t.channels), notes: markRaw(t.notes), version: version++ }))
       this.master = { ...state.master }
       this.tempo = state.tempo ?? this.tempo
+      this.rate = state.rate ?? this.rate
       this.sel = { ...state.sel }
     },
 
@@ -394,7 +414,10 @@ export const useProjectStore = defineStore('project', {
       if (rate === this.rate) return
       const factor = this.rate / rate
       this.stop()
-      for (const t of this.tracks.filter(isAudio)) setChannels(t, t.channels.map(ch => resampleLinear(ch, factor)))
+      for (const t of this.tracks.filter(isAudio)) {
+        const channels = t.channels.map(ch => resampleLinear(ch, factor))
+        setChannels(t, channels, C.scaleClips(t.clips, channels[0].length / Math.max(1, t.channels[0].length)))
+      }
       this.rate = rate
       this.pushState(`Taxa do projeto alterada para ${rate} Hz`)
     },
@@ -543,7 +566,7 @@ export const useProjectStore = defineStore('project', {
         t.selected = false
         const [clip, offset] = this.hasSelection
           ? [this.extract(t, this.sel.t0, this.sel.t1), this.sel.t0]
-          : [{ kind: t.kind, channels: t.channels, notes: t.notes, program: t.program, drum: t.drum, automation: t.automation }, t.offset]
+          : [{ kind: t.kind, channels: t.channels, clips: t.clips, notes: t.notes, program: t.program, drum: t.drum, automation: t.automation }, t.offset]
         this.addTrack({ ...clip, name: `${t.name} (cópia)`, offset, gain: t.gain, pan: t.pan, color: t.color, sends: t.sends, selected: true })
       }
       this.pushState('Duplicar')
@@ -566,11 +589,129 @@ export const useProjectStore = defineStore('project', {
       this.requireTimeSelection()
       for (const t of this.requireEditTargets()) {
         const clip = this.extract(t, this.sel.t0, this.sel.t1)
-        this.silenceRange(t, this.sel.t0, this.sel.t1)
+        this.clearRange(t, this.sel.t0, this.sel.t1)
         t.selected = false
         this.addTrack({ ...clip, name: `${t.name} (dividida)`, offset: this.sel.t0, color: t.color, selected: true })
       }
       this.pushState('Dividir em nova faixa')
+    },
+
+    // ---------- Clips (faixas de áudio) ----------
+    // [t0, t1) vira vão, sem puxar o resto; no MIDI, as notas do trecho somem.
+    clearRange (track, t0, t1) {
+      if (isBus(track)) return
+      if (!isAudio(track)) return this.silenceRange(track, t0, t1)
+      const [s0, s1] = this.clampedRange(track, t0, t1)
+      if (s1 <= s0) return
+      setChannels(track, track.channels.map(ch => replaceRange(ch, s0, s1, zeros(s1 - s0))), C.clearClipRange(track.clips, s0, s1))
+      this.compactClips(track)
+    },
+
+    // O buffer começa no primeiro clip e termina no último (sem silêncio sobrando nas pontas).
+    compactClips (track) {
+      const clips = track.clips
+      const length = track.channels[0]?.length ?? 0
+      if (!clips.length) {
+        if (length) setChannels(track, track.channels.map(() => zeros(0)), [])
+        return
+      }
+      const a = clips[0].s0
+      const b = clips[clips.length - 1].s1
+      if (a === 0 && b === length) return
+      setChannels(track, track.channels.map(ch => ch.slice(a, b)), C.shiftClips(clips, -a))
+      if (a) {
+        track.offset += a / this.rate
+        track.automation = shiftAutomation(track.automation, -a / this.rate)
+      }
+    },
+
+    requireClipTargets () {
+      const targets = this.requireTargets().filter(isAudio)
+      if (!targets.length) throw new Error('Clipes existem nas faixas de áudio. Selecione uma faixa de áudio.')
+      return targets
+    },
+
+    // Divide no cursor, ou nas duas bordas da seleção.
+    splitClip () {
+      const times = this.hasSelection ? [this.sel.t0, this.sel.t1] : [this.sel.t0]
+      let added = 0
+      for (const t of this.requireClipTargets()) {
+        const before = t.clips.length
+        t.clips = C.splitClips(t.clips, times.map(x => this.toSample(t, x)))
+        added += t.clips.length - before
+      }
+      if (!added) throw new Error('Coloque o cursor (ou a seleção) dentro de um clipe para dividir.')
+      this.pushState('Dividir clipe')
+    },
+
+    // Os clipes tocados pela seleção viram um (o vão entre eles fica como silêncio).
+    joinClips () {
+      this.requireTimeSelection()
+      let joined = false
+      for (const t of this.requireClipTargets()) {
+        const before = t.clips.length
+        t.clips = C.joinClips(t.clips, this.toSample(t, this.sel.t0), this.toSample(t, this.sel.t1))
+        joined = joined || t.clips.length < before
+      }
+      if (!joined) throw new Error('Selecione um trecho que pegue dois ou mais clipes.')
+      this.pushState('Juntar clipes')
+    },
+
+    // "Split Delete": tira a seleção e deixa o vão, sem puxar o resto.
+    splitDelete () {
+      this.requireTimeSelection()
+      for (const t of this.requireEditTargets()) this.clearRange(t, this.sel.t0, this.sel.t1)
+      this.setSelection(this.sel.t0, this.sel.t0)
+      this.pushState('Excluir deixando vão')
+      this.syncPlayback()
+    },
+
+    // Move o clipe para `start` (segundos do projeto), sem passar por cima dos vizinhos.
+    moveClip (id, index, start) {
+      const t = this.findTrack(id)
+      const c = t?.clips[index]
+      if (!c) return
+      const len = c.s1 - c.s0
+      const prev = t.clips[index - 1]
+      const next = t.clips[index + 1]
+      let ns = Math.round((start - t.offset) * this.rate)
+      ns = Math.max(ns, prev ? prev.s1 : -Math.round(t.offset * this.rate))
+      if (next) ns = Math.min(ns, next.s0 - len)
+      if (ns === c.s0) return
+      const data = t.channels.map(ch => ch.slice(c.s0, c.s1))
+      let channels = t.channels.map(ch => {
+        const out = new Float32Array(ch)
+        out.fill(0, c.s0, c.s1)
+        return out
+      })
+      let clips = t.clips.filter((_, i) => i !== index)
+      if (ns < 0) {
+        channels = channels.map(ch => concat([zeros(-ns), ch]))
+        clips = C.shiftClips(clips, -ns)
+        t.offset = Math.max(0, t.offset + ns / this.rate)
+        t.automation = shiftAutomation(t.automation, -ns / this.rate)
+        ns = 0
+      }
+      const end = ns + len
+      channels = channels.map((ch, k) => {
+        const out = new Float32Array(Math.max(ch.length, end))
+        out.set(ch)
+        out.set(data[k], ns)
+        return out
+      })
+      setChannels(t, channels, [...clips, { s0: ns, s1: end }])
+      this.compactClips(t)
+      this.pushState('Clipe movido')
+      this.syncPlayback()
+    },
+
+    // Clipe sob o tempo t (segundos do projeto): { index, t0, t1 } ou null.
+    clipAtTime (track, t) {
+      if (!isAudio(track)) return null
+      const index = C.clipAt(track.clips, this.toSample(track, t))
+      if (index < 0) return null
+      const c = track.clips[index]
+      return { index, t0: track.offset + c.s0 / this.rate, t1: track.offset + c.s1 / this.rate }
     },
 
     // ---------- Faixas ----------
@@ -725,7 +866,13 @@ export const useProjectStore = defineStore('project', {
         tracks: [dry], rate: this.rate, t0: t.offset, t1: this.trackEnd(t),
         master: this.master, applyMaster: false, channels: t.channels.length
       })
-      setChannels(t, channels)
+      const clips = t.clips
+      for (const ch of channels) {
+        let from = 0
+        for (const c of clips) { ch.fill(0, from, c.s0); from = c.s1 }
+        ch.fill(0, from)
+      }
+      setChannels(t, channels, channels[0].length === t.channels[0].length ? clips : undefined)
       t.effects = []
       this.pushState(`Efeitos aplicados em "${t.name}"`)
     },
@@ -920,12 +1067,15 @@ export const useProjectStore = defineStore('project', {
       const targets = this.requireAudioTargets()
       let newLength = null
       for (const t of targets) {
-        const [s0, s1] = this.regionOf(t)
-        if (s1 <= s0) continue
-        const region = t.channels.map(ch => ch.slice(s0, s1))
-        const out = await def.process(region, params, { rate: this.rate })
-        setChannels(t, t.channels.map((ch, c) => replaceRange(ch, s0, s1, out[c])))
-        if (newLength === null) newLength = out[0].length
+        // Sem seleção, cada clip separado (do último ao primeiro: os anteriores não se mexem).
+        const ranges = this.hasSelection ? [this.regionOf(t)] : t.clips.map(c => [c.s0, c.s1]).reverse()
+        for (const [s0, s1] of ranges) {
+          if (s1 <= s0) continue
+          const region = t.channels.map(ch => ch.slice(s0, s1))
+          const out = await def.process(region, params, { rate: this.rate })
+          setChannels(t, t.channels.map((ch, c) => replaceRange(ch, s0, s1, out[c])), C.replaceClipRange(t.clips, s0, s1, out[0].length))
+          if (newLength === null) newLength = out[0].length
+        }
       }
       if (newLength === null) throw new Error('Não há áudio na seleção.')
       if (this.hasSelection) this.setSelection(this.sel.t0, this.sel.t0 + newLength / this.rate)
@@ -1157,12 +1307,14 @@ export const useProjectStore = defineStore('project', {
       let channels = track.channels
       if (!channels[0].length) {
         track.offset = t
-        setChannels(track, data)
+        setChannels(track, data, C.wholeClips(data[0].length))
         return
       }
       let s = this.toSample(track, t)
+      let clips = track.clips
       if (s < 0) {
         channels = channels.map(ch => concat([zeros(-s), ch]))
+        clips = C.shiftClips(clips, -s)
         track.automation = shiftAutomation(track.automation, -s / this.rate)
         track.offset = t
         s = 0
@@ -1173,7 +1325,7 @@ export const useProjectStore = defineStore('project', {
         out.set(ch)
         out.set(data[c], s)
         return out
-      }))
+      }), C.addClip(clips, s, end))
     },
 
     // Assíncrono: o motor nativo entrega o último trecho gravado ao parar.

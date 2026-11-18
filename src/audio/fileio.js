@@ -76,6 +76,7 @@ export function encodeProject (project) {
           name: t.name, color: t.color, offset: t.offset, gain: t.gain, pan: t.pan, mute: t.mute, solo: t.solo,
           effects: (t.effects ?? []).map(effectJson),
           channels: t.channels.length, length: t.channels[0].length,
+          clips: (t.clips ?? []).map(c => [c.s0, c.s1]),
           ...mixing(t)
         }),
     master: {
@@ -106,7 +107,8 @@ export async function decodeProject (blob) {
     }
     if (t.kind === 'midi') return { ...t, channels: [], notes: t.notes.map(n => ({ ...n, id: noteId() })) }
     if (t.kind === 'bus') return { ...t, channels: [] }
-    return { ...t, channels }
+    // Sem clips (projeto de antes deles): o buffer inteiro é um clip.
+    return { ...t, channels, clips: t.clips?.map(([s0, s1]) => ({ s0, s1 })) }
   })
   return { name: header.name, rate: header.rate, tempo: header.tempo, tracks, master: header.master }
 }
